@@ -1,0 +1,194 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+  /* Dafy.in Exact Color Scheme & Typography Variables */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-heading: 'Inter Tight', 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  /* Dafy.in Font Colors */
+  --dafy-ink: #f5f5f7;          /* High-contrast primary text / Headings */
+  --dafy-ink-soft: #d2d2d7;     /* Secondary clear body text */
+  --dafy-stone: #a1a1a6;        /* Muted labels / captions / timestamps */
+  --dafy-accent-blue: #38bdf8;  /* Vibrant accent text (replaces invisible dark navy text) */
+
+  /* Dafy.in Surface Backgrounds & Borders */
+  --dafy-paper: #090a0f;        /* Main dark charcoal / black background */
+  --dafy-card: #14171f;         /* Card background */
+  --dafy-mist: #0d1017;         /* Inner container / input well */
+  --dafy-border: #262b36;       /* Subtle dark border */
+
+  /* Primary Action Buttons */
+  --kerago-navy: #002C6C;
+  --kerago-navy-hover: #001f4d;
+}
+
+body {
+  color: var(--dafy-ink);
+  background-color: var(--dafy-paper);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* Dafy.in Typography Hierarchy & Styles */
+h1, h2, h3, h4, h5, h6,
+.font-heading,
+.font-black,
+.font-extrabold,
+.font-bold {
+  font-family: var(--font-heading);
+  letter-spacing: -0.02em;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--dafy-ink);
+}
+
+/* Dafy.in Font Colors & High-Contrast Visibility Overrides */
+/* Overrides dark slate/gray text classes that were blending into dark backgrounds */
+.text-slate-900,
+.text-slate-800,
+.text-gray-900,
+.text-gray-800,
+.text-zinc-900,
+.text-zinc-800 {
+  color: #f5f5f7 !important; /* Dafy ink */
+}
+
+.text-slate-700,
+.text-gray-700,
+.text-zinc-700 {
+  color: #d2d2d7 !important; /* Dafy ink-soft */
+}
+
+.text-slate-600,
+.text-slate-500,
+.text-gray-600,
+.text-gray-500,
+.text-zinc-600,
+.text-zinc-500 {
+  color: #a1a1a6 !important; /* Dafy stone (labels & muted subtext) */
+}
+
+.text-slate-400,
+.text-gray-400 {
+  color: #8e8e93 !important;
+}
+
+/* Prevent dark navy text from disappearing against dark backgrounds */
+.text-\[\#002C6C\] {
+  color: #38bdf8 !important; /* Visible crisp blue on dark */
+}
+
+/* Headings with text-[#002C6C] use Dafy ink (crisp white) */
+h1.text-\[\#002C6C\],
+h2.text-\[\#002C6C\],
+h3.text-\[\#002C6C\],
+h4.text-\[\#002C6C\] {
+  color: #f5f5f7 !important;
+}
+
+/* Badge & Tag dark text visibility */
+.text-blue-950, .text-blue-900, .text-blue-800, .text-blue-700 {
+  color: #93c5fd !important;
+}
+.text-cyan-900, .text-cyan-800, .text-cyan-700 {
+  color: #67e8f9 !important;
+}
+.text-indigo-950, .text-indigo-900, .text-indigo-800, .text-indigo-700 {
+  color: #c7d2fe !important;
+}
+.text-emerald-950, .text-emerald-900, .text-emerald-800, .text-emerald-700 {
+  color: #6ee7b7 !important;
+}
+.text-amber-950, .text-amber-900, .text-amber-800, .text-amber-700 {
+  color: #fcd34d !important;
+}
+.text-rose-950, .text-rose-900, .text-rose-800, .text-rose-700,
+.text-red-950, .text-red-900, .text-red-800, .text-red-700 {
+  color: #fda4af !important;
+}
+
+/* Form Inputs, Dropdowns & Placeholders */
+input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+textarea,
+select {
+  color: #f5f5f7 !important;
+  background-color: #0d1017;
+  font-family: var(--font-sans);
+}
+
+select option {
+  background-color: #14171f !important;
+  color: #f5f5f7 !important;
+}
+
+::placeholder {
+  color: #8e8e93 !important;
+  opacity: 1 !important;
+}
+
+/* Dafy.in Dark Theme Card & Button Aesthetics */
+.dafy-card {
+  background-color: #14171f;
+  border: 1px solid #262b36;
+  border-radius: 1.25rem;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.dafy-card-mist {
+  background-color: #0d1017;
+  border: 1px solid #262b36;
+  border-radius: 1rem;
+}
+
+.dafy-btn-navy {
+  background-color: #002C6C;
+  color: #ffffff;
+  transition: all 0.2s ease;
+}
+
+.dafy-btn-navy:hover {
+  background-color: #001f4d;
+}
+
+/* Custom smooth transitions */
+.kerago-gradient-hero {
+  background: linear-gradient(135deg, #050608 0%, #001f4d 50%, #002C6C 100%);
+}
+
+.kerago-glass-nav {
+  background: rgba(9, 10, 15, 0.95);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.kerago-card-hover {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.kerago-card-hover:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 12px 28px -6px rgba(0, 44, 108, 0.3), 0 4px 10px -2px rgba(0, 0, 0, 0.4);
+}
+
+/* Custom scrollbars for dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #090a0f;
+}
+::-webkit-scrollbar-thumb {
+  background: #262b36;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4354;
+}

@@ -1,0 +1,505 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider     = "postgresql"
+  url          = env("DATABASE_URL")
+  relationMode = "prisma"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum VehicleCategory {
+  bike
+  auto
+  ev
+  automatic
+  sedan
+  suv
+  premium
+}
+
+enum RideServiceType {
+  one_way       @map("one-way")
+  round_trip    @map("round-trip")
+  hospital_assistance @map("hospital-assistance")
+  bar_pickup    @map("bar-pickup")
+  tour_package  @map("tour-package")
+  airport_transfer @map("airport-transfer")
+  advance_event @map("advance-event")
+  hourly_driver @map("hourly-driver")
+  self_drive    @map("self-drive")
+}
+
+enum BookingStatus {
+  pending
+  approved
+  accepted
+  driver_arriving
+  arrived
+  in_progress
+  completed
+  cancelled
+  declined
+}
+
+enum DriverApprovalStatus {
+  pending
+  approved
+  rejected
+  suspended
+}
+
+enum PaymentMethod {
+  cash
+  upi
+  card
+}
+
+enum PaymentStatus {
+  pending
+  completed
+  refunded
+}
+
+enum ReviewerRole {
+  customer
+  driver
+}
+
+enum ComplaintCategory {
+  fare_dispute
+  rash_driving
+  cleanliness
+  unprofessional
+  route_deviation
+  other
+}
+
+enum ComplaintStatus {
+  submitted
+  under_review
+  resolved
+  closed
+}
+
+enum DocumentType {
+  driving_license
+  vehicle_rc
+  insurance
+  police_clearance
+}
+
+enum DocumentStatus {
+  pending
+  verified
+  rejected
+}
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+model Customer {
+  id                   String    @id @default(cuid())
+  name                 String
+  phone                String    @unique
+  email                String    @unique
+  city                 String
+  password             String    // hashed or plain for local dev
+  emergencyContact     String?
+  favouriteDriverIds   String[]  @default([])
+  firstRidePromoUsed   Boolean   @default(false)
+  firstRidePromoUsedAt DateTime?
+  createdAt            DateTime  @default(now())
+
+  vehicles   CustomerVehicle[]
+  bookings   Booking[]
+  reviews    Review[]   @relation("CustomerReviews")
+  complaints Complaint[] @relation("CustomerComplaints")
+
+  @@map("customers")
+}
+
+model CustomerVehicle {
+  id           String   @id @default(cuid())
+  customerId   String
+  makeModel    String
+  vehicleType  String   @default("sedan")
+  transmission String   @default("manual")
+  fuelType     String   @default("petrol")
+  notes        String?
+  isDefault    Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  customer     Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@map("customer_vehicles")
+}
+
+model Driver {
+  id                       String               @id @default(cuid())
+  name                     String
+  phone                    String               @unique
+  email                    String               @unique
+  city                     String
+  password                 String               // hashed or plain for local dev
+  licenseNumber            String               @unique
+  vehicleRc                String?              // legacy
+  vehicleModel             String?              @default("Customer Vehicle") // legacy
+  vehicleCategory          VehicleCategory?     @default(sedan) // legacy
+  transmissionCapabilities String[]             @default(["manual", "automatic"])
+  fuelCapabilities         String[]             @default(["petrol", "diesel", "ev"])
+  approvalStatus           DriverApprovalStatus @default(pending)
+  approvalNotes            String?
+  isOnline                 Boolean              @default(false)
+  totalTrips               Int                  @default(0)
+  totalEarnings            Float                @default(0)
+  pendingPayout            Float                @default(0)
+  walletBalance            Float                @default(0)
+  ratingAverage            Float                @default(0)
+  ratingCount              Int                  @default(0)
+  createdAt                DateTime             @default(now())
+
+  documents  DriverDocument[]
+  bookings   Booking[]
+  reviews    Review[]    @relation("DriverReviews")
+  complaints Complaint[] @relation("DriverComplaints")
+  notices    DriverNotice[]
+  whatsappBookings WhatsAppBooking[]
+  walletTransactions DriverWalletTransaction[]
+
+  @@map("drivers")
+}
+
+model DriverDocument {
+  id         String         @id @default(cuid())
+  driverId   String
+  type       DocumentType
+  filename   String
+  uploadedAt DateTime       @default(now())
+  status     DocumentStatus @default(pending)
+
+  driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@map("driver_documents")
+}
+
+model Booking {
+  id                  String          @id @default(cuid())
+  refCode             String          @unique
+  customerId          String
+  customerName        String
+  customerPhone       String
+  passengerName       String?
+  passengerPhone      String?
+  serviceType         RideServiceType
+  vehicleCategory     VehicleCategory
+  transmission        String?
+  fuelType            String?
+  customerVehicle     Json?
+  pickupLocation      String
+  destinationLocation String
+  stops               Json            @default("[]")
+  scheduledDate       String
+  scheduledTime       String
+  isRoundTrip         Boolean         @default(false)
+  returnDate          String?
+  returnTime          String?
+  durationHours       Float?
+  flightTrainNumber   String?
+  medicalNotes        String?
+  hospitalNotes       String?
+  tourItineraryNotes  String?
+  tourNotes           String?
+  fareBreakdown       Json
+  rideStartOtp        String
+  status              BookingStatus   @default(pending)
+  driverId            String?
+  driverName          String?
+  driverPhone         String?
+  driverVehicle       String?
+  driverRating        Float?
+  paymentMethod       PaymentMethod   @default(cash)
+  paymentStatus       PaymentStatus   @default(pending)
+  passengerPaid       Boolean         @default(false)
+  passengerPaidAt     DateTime?
+  driverPaymentReceived Boolean       @default(false)
+  driverPaymentReceivedAt DateTime?
+  driverCreditedSalary Float?
+  platformCommission  Float?
+  cancelledBy         String?
+  cancellationReason  String?
+  emergencyContact    String?
+  rentalVehicleId     String?
+  rentalVehicleModel  String?
+  advanceAmount       Float?
+  remainingAmount     Float?
+  advancePaid         Boolean         @default(false)
+  advancePaidAt       DateTime?
+  remainingPaid       Boolean         @default(false)
+  remainingPaidAt     DateTime?
+  cancellationFee     Float?
+  refundAmount        Float?
+  notificationMessage String?
+  extendedDays        Int?
+  extensionFee        Float?
+  favouriteDriverId   String?
+  requestedDriverName String?
+  requestQueueStatus  String?         @default("broadcast") // 'exclusive_favourite' | 'broadcast' | 'assigned' | 'expired'
+  exclusiveUntil      DateTime?
+  pricingModel        String?         // 'kilometer' | 'minute' | 'rental'
+  bookingChannel      String?         @default("website") // 'website' | 'whatsapp'
+  selectedDriverExclusive Boolean?    @default(false)
+  declinedDriverIds   String[]        @default([])
+  rideCompletedAt     DateTime?
+  actualDistanceKm    Float?
+  actualDurationMinutes Int?
+
+  // Requirement 1: Salary Crediting & Payment Reference
+  salaryCreditTxId    String?
+  salaryCreditedAt    DateTime?
+  paymentTransactionRef String?
+
+  // Requirement 2: Live Trip Sharing & Driver GPS Tracking
+  shareToken          String?         @unique
+  shareTokenCreatedAt DateTime?
+  shareTokenExpiresAt DateTime?
+  isSharingActive     Boolean         @default(false)
+  driverLiveLat       Float?
+  driverLiveLng       Float?
+  driverLiveHeading   Float?
+  driverLiveSpeed     Float?
+  driverLiveUpdatedAt DateTime?
+
+  // Requirement 3: Bookings For Others (Travelling Passenger vs Booking Customer)
+  bookingFor          String?         @default("myself") // 'myself' | 'someone_else'
+  passengerRelationship String?       // 'family' | 'friend' | 'colleague' | 'other'
+  passengerSpecialInstructions String?
+
+  createdAt           DateTime        @default(now())
+
+  customer   Customer  @relation(fields: [customerId], references: [id])
+  driver     Driver?   @relation(fields: [driverId], references: [id])
+  reviews    Review[]
+  complaints Complaint[]
+
+  @@map("bookings")
+}
+
+model Review {
+  id               String      @id @default(cuid())
+  bookingId        String
+  bookingRef       String
+  reviewerId       String
+  reviewerName     String
+  reviewerRole     ReviewerRole
+  targetId         String
+  targetName       String
+  targetRole       ReviewerRole
+  punctualityRating Int
+  cleanlinessRating Int
+  comfortRating    Int
+  overallRating    Int
+  comment          String      @default("")
+  adminReply       String?
+  adminRepliedAt   DateTime?
+  verifiedTrip     Boolean     @default(true)
+  createdAt        DateTime    @default(now())
+
+  booking          Booking   @relation(fields: [bookingId], references: [id])
+  customerReviewer Customer? @relation("CustomerReviews", fields: [reviewerId], references: [id], map: "customer_reviewer_fk")
+  driverReviewer   Driver?   @relation("DriverReviews",   fields: [reviewerId], references: [id], map: "driver_reviewer_fk")
+
+  @@map("reviews")
+}
+
+model Complaint {
+  id               String            @id @default(cuid())
+  bookingId        String
+  bookingRef       String
+  complainantId    String
+  complainantName  String
+  complainantRole  ReviewerRole
+  category         ComplaintCategory
+  description      String
+  status           ComplaintStatus   @default(submitted)
+  resolutionNotes  String?
+  createdAt        DateTime          @default(now())
+
+  booking              Booking   @relation(fields: [bookingId], references: [id])
+  customerComplainant  Customer? @relation("CustomerComplaints", fields: [complainantId], references: [id], map: "customer_complainant_fk")
+  driverComplainant    Driver?   @relation("DriverComplaints",   fields: [complainantId], references: [id], map: "driver_complainant_fk")
+
+  @@map("complaints")
+}
+
+model RentalVehicle {
+  id                String    @id
+  ownerId           String    @default("own-1")
+  ownerName         String    @default("DriveC Fleet")
+  ownerPhone        String    @default("+91 98471 22334")
+  model             String
+  brand             String
+  category          String    @default("sedan")
+  transmission      String    @default("automatic")
+  fuel              String    @default("petrol")
+  seats             Int       @default(5)
+  luggageCapacity   String    @default("3 Large Bags")
+  licensePlate      String    @unique
+  year              Int       @default(2024)
+  dailyRate         Float     @default(2000)
+  hourlyRate        Float     @default(200)
+  advanceAmount     Float     @default(1000)
+  location          String    @default("Kochi, Kerala")
+  isAvailable       Boolean   @default(true)
+  offlineUntil      String?
+  maintenanceReason String?
+  approvalStatus    String    @default("approved")
+  features          Json      @default("[]")
+  totalRentals      Int       @default(0)
+  ratingAverage     Float     @default(4.9)
+  ratingCount       Int       @default(10)
+  createdAt         DateTime  @default(now())
+
+  @@map("rental_vehicles")
+}
+
+model DriverNotice {
+  id             String    @id @default(cuid())
+  driverId       String
+  driverName     String
+  driverPhone    String?
+  adminId        String    @default("admin-master")
+  adminName      String    @default("DriveC Administrator")
+  reviewId       String?
+  bookingId      String?
+  bookingRef     String?
+  type           String    // "warning" | "suspension"
+  reason         String    // The admin's warning letter / reason
+  status         String    @default("active") // "active" | "dismissed"
+  isAcknowledged Boolean   @default(false)
+  acknowledgedAt DateTime?
+  replies        Json      @default("[]")
+  createdAt      DateTime  @default(now())
+
+  driver         Driver    @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@map("driver_notices")
+}
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@map("system_settings")
+}
+
+model WhatsAppBooking {
+  id                 String   @id @default(cuid())
+  waMessageId        String   @unique
+  senderPhone        String
+  senderName         String?
+  serviceType        String?
+  pickupLocation     String?
+  pickupPin          String?
+  dropoffLocation    String?
+  scheduledDate      String?
+  scheduledTime      String?
+  preferredDriver    String?
+  matchedDriverId    String?
+  matchedDriverName  String?
+  routingStatus      String   @default("general_admin") // 'routed_to_driver' | 'driver_identification_required' | 'general_admin' | 'reassigned'
+  calculatedKm       Float?
+  calculatedMinutes  Int?
+  estimatedFare      Float?
+  pricingModel       String?  // 'kilometer' | 'minute'
+  rawMessage         String
+  status             String   @default("pending_verification") // 'pending_verification' | 'converted' | 'rejected'
+  isComplete         Boolean  @default(false)
+  convertedBookingId String?
+  adminNotes         String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  driver             Driver?  @relation(fields: [matchedDriverId], references: [id], onDelete: SetNull)
+
+  @@map("whatsapp_bookings")
+}
+
+model DisputeNotification {
+  id         String    @id @default(cuid())
+  noticeId   String    // Related DriverNotice ID / Case ID
+  driverId   String    // Related Driver ID
+  driverName String?
+  adminId    String    @default("admin-master")
+  targetRole String    // 'admin' | 'driver' (who this notification is meant for)
+  eventType  String    // 'warning_issued' | 'suspension_issued' | 'admin_reply' | 'driver_reply' | 'driver_acknowledged'
+  title      String
+  message    String
+  isRead     Boolean   @default(false)
+  readAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@map("dispute_notifications")
+}
+
+model RentalExtension {
+  id                    String    @id @default(cuid())
+  bookingId             String
+  bookingRef            String
+  customerId            String
+  customerName          String
+  customerPhone         String
+  rentalVehicleId       String
+  vehicleModel          String
+  licensePlate          String
+  originalPickupDate    String
+  originalReturnDate    String
+  requestedReturnDate   String
+  approvedReturnDate    String?
+  additionalDays        Int
+  dailyRate             Float
+  extensionPrice        Float
+  existingTotalAmount   Float
+  updatedTotalAmount    Float
+  status                String    @default("pending") // 'pending' | 'approved' | 'declined'
+  adminDecision         String?   // 'approved' | 'declined'
+  adminId               String?
+  adminNotes            String?
+  decisionAt            DateTime?
+  paymentStatus         String    @default("pending") // 'pending' | 'completed'
+  paymentMethod         String?
+  paymentTransactionRef String?
+  paidAt                DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@map("rental_extensions")
+}
+
+model DriverWalletTransaction {
+  id              String   @id @default(cuid())
+  driverId        String
+  bookingId       String   @unique
+  bookingRef      String
+  amount          Float
+  grossFare       Float
+  commission      Float
+  status          String   @default("completed") // "completed"
+  customerName    String
+  passengerName   String?
+  transactionRef  String?
+  createdAt       DateTime @default(now())
+
+  driver          Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+
+  @@map("driver_wallet_transactions")
+}
+
+
+

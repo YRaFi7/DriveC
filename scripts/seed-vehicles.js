@@ -1,0 +1,120 @@
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+
+const INITIAL_VEHICLES = [
+  {
+    id: 'rv-1',
+    ownerId: 'own-1',
+    ownerName: 'Mathew Varghese',
+    ownerPhone: '+91 98471 22334',
+    model: 'Hyundai Creta SX (O)',
+    brand: 'Hyundai',
+    category: 'suv',
+    transmission: 'automatic',
+    fuel: 'petrol',
+    seats: 5,
+    luggageCapacity: '3 Large Bags',
+    licensePlate: 'KL-07-CS-4412',
+    year: 2024,
+    dailyRate: 2400,
+    hourlyRate: 250,
+    advanceAmount: 1200,
+    location: 'Kakkanad Infopark, Kochi',
+    isAvailable: true,
+    approvalStatus: 'approved',
+    features: ['Sunroof', 'Touchscreen Apple CarPlay', 'Reverse Camera', 'Dual Airbags', 'Fastag'],
+    totalRentals: 14,
+    ratingAverage: 4.9,
+    ratingCount: 12,
+  },
+  {
+    id: 'rv-2',
+    ownerId: 'own-2',
+    ownerName: 'Anjali Menon',
+    ownerPhone: '+91 94470 55667',
+    model: 'Honda City ZX i-VTEC',
+    brand: 'Honda',
+    category: 'sedan',
+    transmission: 'automatic',
+    fuel: 'petrol',
+    seats: 5,
+    luggageCapacity: '2 Large + 2 Cabin',
+    licensePlate: 'KL-07-DB-8819',
+    year: 2023,
+    dailyRate: 1900,
+    hourlyRate: 200,
+    advanceAmount: 1000,
+    location: 'Panampilly Nagar, Ernakulam Central',
+    isAvailable: true,
+    approvalStatus: 'approved',
+    features: ['Leather Seats', 'Cruise Control', 'Dashcam', 'Lane Watch Camera'],
+    totalRentals: 22,
+    ratingAverage: 4.8,
+    ratingCount: 19,
+  },
+  {
+    id: 'rv-3',
+    ownerId: 'own-3',
+    ownerName: 'Nivin Kurian',
+    ownerPhone: '+91 97455 88990',
+    model: 'Maruti Suzuki Swift ZXi',
+    brand: 'Maruti',
+    category: 'hatchback',
+    transmission: 'manual',
+    fuel: 'petrol',
+    seats: 4,
+    luggageCapacity: '2 Cabin Bags',
+    licensePlate: 'KL-07-CP-3310',
+    year: 2023,
+    dailyRate: 1200,
+    hourlyRate: 130,
+    advanceAmount: 800,
+    location: 'Edappally Toll, Kochi',
+    isAvailable: true,
+    approvalStatus: 'approved',
+    features: ['Fuel Efficient 22 km/l', 'Bluetooth Audio', 'Air Conditioning', 'Power Windows'],
+    totalRentals: 31,
+    ratingAverage: 4.7,
+    ratingCount: 26,
+  },
+  {
+    id: 'rv-4',
+    ownerId: 'own-1',
+    ownerName: 'Mathew Varghese',
+    ownerPhone: '+91 98471 22334',
+    model: 'Toyota Innova Crysta 2.4 VX',
+    brand: 'Toyota',
+    category: 'premium',
+    transmission: 'manual',
+    fuel: 'diesel',
+    seats: 7,
+    luggageCapacity: '4 Large Bags',
+    licensePlate: 'KL-07-CQ-9901',
+    year: 2023,
+    dailyRate: 3400,
+    hourlyRate: 350,
+    advanceAmount: 1500,
+    location: 'Cochin Airport Depot (COK), Nedumbassery',
+    isAvailable: true,
+    approvalStatus: 'approved',
+    features: ['7-Seater Captain Seats', 'Rear AC vents', 'Roof Luggage Carrier', 'Hill Assist'],
+    totalRentals: 18,
+    ratingAverage: 5.0,
+    ratingCount: 15,
+  }
+];
+
+async function seed() {
+  for (const v of INITIAL_VEHICLES) {
+    await prisma.rentalVehicle.upsert({
+      where: { id: v.id },
+      update: {},
+      create: v
+    });
+  }
+  const all = await prisma.rentalVehicle.findMany();
+  console.log(`Seeded rental vehicles successfully. Total in DB: ${all.length}`);
+  await prisma.$disconnect();
+}
+
+seed();
