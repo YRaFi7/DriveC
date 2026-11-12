@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { Language, Driver, Booking, UserRole, Review, DriverNotice, WhatsAppBookingEnquiry } from '../types';
 import { translations } from '../lib/translations';
 import { DisputeNotification } from '../types';
+import { isDriverVehicleCompatible } from '../lib/validation';
 
 interface DriverPortalProps {
   language: Language;
@@ -255,7 +256,10 @@ export const DriverPortal: React.FC<DriverPortalProps> = ({
 
       // Broadcast pending request (WhatsApp broadcast or Accept Random Drivers)
       if (b.status === 'pending' && b.requestQueueStatus === 'broadcast') {
-        return currentDriver.approvalStatus === 'approved';
+        if (currentDriver.approvalStatus !== 'approved' || !currentDriver.isOnline) return false;
+        const bTrans = b.transmission || b.customerVehicle?.transmission;
+        const bFuel = b.fuelType || b.customerVehicle?.fuel;
+        return isDriverVehicleCompatible(currentDriver, { transmission: bTrans, fuelType: bFuel });
       }
 
       // Active or completed booking assigned to this driver
@@ -279,6 +283,7 @@ export const DriverPortal: React.FC<DriverPortalProps> = ({
     booking?: Booking;
     reason?: string;
   } | null>(null);
+  const [completingBookingId, setCompletingBookingId] = useState<string | null>(null);
 
   const handleCreditSalary = async (b: Booking) => {
     // Strict pre-check: if customer has not paid, show exact popup modal immediately
@@ -925,7 +930,7 @@ export const DriverPortal: React.FC<DriverPortalProps> = ({
                 // If confirmed with matching OTP -> Green
                 // If invalid OTP -> Yellow
                 const cardState = cardColorState[b.id] || (
-                  b.status === 'accepted' || b.status === 'in_progress' || b.status === 'completed'
+                  b.status === 'accepted' || b.status === 'in_progress' || b.status === 'awaiting_payment' || b.status === 'completed'
                     ? 'confirmed'
                     : 'normal'
                 );
@@ -964,13 +969,14 @@ export const DriverPortal: React.FC<DriverPortalProps> = ({
                         </div>
                         <span className={`text-[10px] font-bold uppercase px-2.5 py-1 rounded-full ${
                           b.status === 'completed' ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-700/80' :
+                          b.status === 'awaiting_payment' ? 'bg-amber-900/60 text-amber-200 border border-amber-700/70 font-black animate-pulse' :
                           b.status === 'in_progress' ? 'bg-[#002C6C]/50 text-cyan-300 border border-blue-800/70 animate-pulse' :
                           b.status === 'driver_arriving' ? 'bg-[#002C6C]/50 text-cyan-300 border border-blue-800/70 animate-pulse' :
                           b.status === 'cancelled' ? 'bg-rose-950/70 text-rose-300 border border-rose-800/80' :
                           b.status === 'pending' ? 'bg-amber-900/60 text-amber-200 border border-amber-700/70 font-black animate-pulse' :
                           'bg-[#002C6C]/50 text-cyan-300 border border-blue-800/70'
                         }`}>
-                          {b.status === 'pending' ? '⚡ INCOMING REQUEST' : b.status.replace('_', ' ')}
+                          {b.status === 'pending' ? '⚡ INCOMING REQUEST' : b.status === 'awaiting_payment' ? 'Awaiting Payment' : b.status.replace('_', ' ')}
                         </span>
                       </div>
 
@@ -1200,11 +1206,36 @@ export const DriverPortal: React.FC<DriverPortalProps> = ({
                           </div>
 
                           <button
-                            onClick={() => onUpdateBookingStatus(b.id, 'completed', { isDelayed: b.isDelayed || false })}
-                            className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs shadow-md"
+                            type="button"
+                            disabled={completingBookingId === b.id}
+                            onClick={async () => {
+                              if (completingBookingId === b.id) return;
+                              setCompletingBookingId(b.id);
+                              try {
+                                await onUpdateBookingStatus(b.id, 'awaiting_payment', { isDelayed: b.isDelayed || false });
+                              } finally {
+                                setCompletingBookingId(null);
+                              }
+                            }}
+                            className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black text-xs shadow-md cursor-pointer"
                           >
-                            Destination Reached • Complete Ride
+                            {completingBookingId === b.id ? 'Updating...' : 'Destination Reached • Complete Ride'}
                           </button>
+                        </div>
+                      )}
+
+                      {/* AWAITING CUSTOMER PAYMENT */}
+                      {b.status === 'awaiting_payment' && (
+                        <div className="p-3 bg-amber-950/50 border border-amber-700/80 rounded-xl space-y-1.5 text-xs">
+                          <div className="flex items-center justify-between">
+                            <span className="font-black text-amber-200">Awaiting Customer Payment</span>
+                            <span className="font-mono font-bold text-white bg-amber-900/60 px-2 py-0.5 rounded text-[11px]">
+                              ₹{b.fareBreakdown.totalFare}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-amber-200/80">
+                            Customer is completing payment (Cash, Card, or UPI). Salary crediting and ride completion will unlock once payment is confirmed.
+                          </p>
                         </div>
                       )}
 

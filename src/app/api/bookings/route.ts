@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { isDriverVehicleCompatible } from '@/lib/validation';
 
 // GET /api/bookings
 // Query params:
@@ -204,7 +205,7 @@ export async function POST(req: NextRequest) {
 
     // Verify driver exists if driverId provided (try ID, phone, or name)
     let validDriverId: string | null = null;
-    let targetDriverObj = null;
+    let targetDriverObj: Awaited<ReturnType<typeof prisma.driver.findUnique>> = null;
 
     if (driverId) {
       const existingDriver = await prisma.driver.findUnique({ where: { id: driverId } });
@@ -256,71 +257,6 @@ export async function POST(req: NextRequest) {
 
     console.log(`[DIAGNOSTIC] Processing booking creation. RefCode: ${effectiveRefCode}, Mode: ${driverSelectionMode}, DriverRequested: ${validDriverId || 'none'}, Channel: ${body.bookingChannel || 'website'}`);
 
-    if (driverSelectionMode === 'random') {
-      validDriverId = null;
-      targetDriverObj = null;
-    } else if (driverSelectionMode === 'favourite') {
-      const favId = body.favouriteDriverId || validDriverId;
-      const favDriverObj = await prisma.driver.findUnique({ where: { id: favId } });
-      if (!favDriverObj || favDriverObj.approvalStatus !== 'approved' || !favDriverObj.isOnline) {
-        console.log(`[DIAGNOSTIC] Favourite driver (${favId}) is offline/unapproved. Rejecting with 409.`);
-        return NextResponse.json({
-          error: 'driver_offline',
-          message: 'Driver is offline.',
-          driverSelectionMode: 'favourite',
-        }, { status: 409 });
-      }
-
-      const activeRide = await prisma.booking.findFirst({
-        where: {
-          driverId: favId,
-          status: { in: ['accepted', 'driver_arriving', 'arrived', 'in_progress'] },
-        },
-      });
-
-      if (activeRide) {
-        console.log(`[DIAGNOSTIC] Favourite driver (${favId}) is busy on ride ${activeRide.id}. Rejecting with 409.`);
-        return NextResponse.json({
-          error: 'driver_busy',
-          message: 'Driver is on another ride.',
-          driverSelectionMode: 'favourite',
-        }, { status: 409 });
-      }
-
-      validDriverId = favDriverObj.id;
-      targetDriverObj = favDriverObj;
-    } else if (driverSelectionMode === 'specific' && validDriverId) {
-      if (!targetDriverObj) {
-        targetDriverObj = await prisma.driver.findUnique({ where: { id: validDriverId } });
-      }
-
-      if (!targetDriverObj || targetDriverObj.approvalStatus !== 'approved' || !targetDriverObj.isOnline) {
-        console.log(`[DIAGNOSTIC] Selected driver (${validDriverId}) is offline. Rejecting with 409.`);
-        return NextResponse.json({
-          error: 'driver_unavailable',
-          message: 'This driver is currently offline.',
-          driverSelectionMode: 'specific',
-        }, { status: 409 });
-      }
-
-      // Check if driver is already on an active ride
-      const activeRide = await prisma.booking.findFirst({
-        where: {
-          driverId: validDriverId,
-          status: { in: ['accepted', 'driver_arriving', 'arrived', 'in_progress'] },
-        },
-      });
-
-      if (activeRide) {
-        console.log(`[DIAGNOSTIC] Selected driver (${validDriverId}) is busy on ride ${activeRide.id}. Rejecting with 409.`);
-        return NextResponse.json({
-          error: 'driver_busy',
-          message: 'This driver is currently on another ride.',
-          driverSelectionMode: 'specific',
-        }, { status: 409 });
-      }
-    }
-
     // Normalize serviceType (Prisma enum uses underscores, UI uses hyphens)
     const normalizedServiceType = (serviceType || 'one_way').replace(/-/g, '_') as any;
 
@@ -335,66 +271,213 @@ export async function POST(req: NextRequest) {
               ? 'exclusive_selected'
               : 'broadcast'));
 
-    const booking = await prisma.booking.create({
-      data: {
-        refCode: effectiveRefCode,
-        bookingChannel: body.bookingChannel || (isRental ? 'rental' : 'website'),
-        selectedDriverExclusive: isWebsiteDriverExclusive,
-        customerId: validCustomerId,
-        customerName,
-        customerPhone,
-        passengerName: passengerName || customerName,
-        passengerPhone: passengerPhone || customerPhone,
-        bookingFor: body.bookingFor || 'myself',
-        passengerRelationship: body.passengerRelationship || undefined,
-        passengerSpecialInstructions: body.passengerSpecialInstructions || undefined,
-        serviceType: normalizedServiceType,
-        vehicleCategory: vehicleCategory === 'auto' ? 'auto' : (vehicleCategory === 'ev' ? 'ev' : vehicleCategory),
-        transmission: body.transmission || body.customerVehicle?.transmission || undefined,
-        fuelType: body.fuelType || body.customerVehicle?.fuel || undefined,
-        customerVehicle: body.customerVehicle || undefined,
-        pickupLocation,
-        destinationLocation: effectiveDest,
-        stops: stops ?? [],
-        scheduledDate,
-        scheduledTime,
-        isRoundTrip: Boolean(isRoundTrip),
-        returnDate,
-        returnTime,
-        durationHours,
-        flightTrainNumber,
-        medicalNotes,
-        hospitalNotes,
-        tourItineraryNotes,
-        tourNotes,
-        fareBreakdown,
-        rideStartOtp: effectiveOtp,
-        driverId: validDriverId,
-        driverName: (targetDriverObj?.name || driverName) || undefined,
-        driverPhone: (targetDriverObj?.phone || driverPhone) || undefined,
-        driverVehicle: (targetDriverObj?.vehicleModel || driverVehicle) || undefined,
-        driverRating: typeof (targetDriverObj?.ratingAverage || driverRating) === 'number' ? (targetDriverObj?.ratingAverage || driverRating) : undefined,
-        favouriteDriverId: driverSelectionMode === 'favourite' ? (body.favouriteDriverId || validDriverId) : null,
-        requestedDriverName: body.requestedDriverName || targetDriverObj?.name || driverName || undefined,
-        requestQueueStatus: effectiveQueueStatus,
-        exclusiveUntil: driverSelectionMode === 'favourite' ? new Date(Date.now() + 60 * 1000) : null,
-        pricingModel,
-        declinedDriverIds: [],
-        paymentMethod: paymentMethod ?? 'cash',
-        emergencyContact,
-        status: 'pending',
-        paymentStatus: 'pending',
-        rentalVehicleId: rentalVehicleId || undefined,
-        rentalVehicleModel: rentalVehicleModel || undefined,
-        advanceAmount: typeof advanceAmount === 'number' ? advanceAmount : (fareBreakdown?.advanceAmount ?? undefined),
-        remainingAmount: typeof remainingAmount === 'number' ? remainingAmount : (fareBreakdown?.remainingAmount ?? undefined),
-        advancePaid: isRental ? true : false,
-        advancePaidAt: isRental ? new Date() : undefined,
-        notificationMessage: isRental 
-          ? 'New self-drive rental reservation submitted. Pending Admin Approval.'
-          : undefined,
-      },
+    // Serialize concurrent booking creation / cancellation per customer using a transaction-scoped advisory lock
+    const txResult = await prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'booking_customer_' + validCustomerId}))`;
+
+      // Duplicate booking protection for driver rides: check for an existing active booking first
+      if (!isRental) {
+        const existingActiveBooking = await tx.booking.findFirst({
+          where: {
+            OR: [
+              { customerId: validCustomerId },
+              ...(customerPhone ? [{ customerPhone }] : []),
+            ],
+            rentalVehicleId: null,
+            serviceType: { not: 'self_drive' },
+            status: {
+              in: ['pending', 'approved', 'accepted', 'driver_arriving', 'arrived', 'in_progress', 'awaiting_payment'],
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+          include: { driver: true, customer: true },
+        });
+
+        if (existingActiveBooking) {
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'already_booked',
+              code: 'ALREADY_BOOKED',
+              message: 'You have already booked. Do you want to cancel the ride and look for another driver?',
+              activeBooking: existingActiveBooking,
+            },
+          };
+        }
+      }
+
+      if (driverSelectionMode === 'random') {
+        validDriverId = null;
+        targetDriverObj = null;
+      } else if (driverSelectionMode === 'favourite') {
+        const favId = body.favouriteDriverId || validDriverId;
+        const favDriverObj = await tx.driver.findUnique({ where: { id: favId } });
+        if (!favDriverObj || favDriverObj.approvalStatus !== 'approved' || !favDriverObj.isOnline) {
+          console.log(`[DIAGNOSTIC] Favourite driver (${favId}) is offline/unapproved. Rejecting with 409.`);
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'driver_offline',
+              message: 'Driver is offline.',
+              driverSelectionMode: 'favourite',
+            },
+          };
+        }
+
+        const requestedTrans = body.transmission || body.customerVehicle?.transmission;
+        const requestedFuel = body.fuelType || body.customerVehicle?.fuel;
+        if (!isDriverVehicleCompatible(favDriverObj, { transmission: requestedTrans, fuelType: requestedFuel })) {
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'driver_incompatible',
+              message: 'This driver is not compatible with your vehicle transmission or fuel type.',
+              driverSelectionMode: 'favourite',
+            },
+          };
+        }
+
+        const activeRide = await tx.booking.findFirst({
+          where: {
+            driverId: favId,
+            status: { in: ['accepted', 'driver_arriving', 'arrived', 'in_progress', 'awaiting_payment'] },
+          },
+        });
+
+        if (activeRide) {
+          console.log(`[DIAGNOSTIC] Favourite driver (${favId}) is busy on ride ${activeRide.id}. Rejecting with 409.`);
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'driver_busy',
+              message: 'Driver is on another ride.',
+              driverSelectionMode: 'favourite',
+            },
+          };
+        }
+
+        validDriverId = favDriverObj.id;
+        targetDriverObj = favDriverObj;
+      } else if (driverSelectionMode === 'specific' && validDriverId) {
+        if (!targetDriverObj) {
+          targetDriverObj = await tx.driver.findUnique({ where: { id: validDriverId } });
+        }
+
+        if (!targetDriverObj || targetDriverObj.approvalStatus !== 'approved' || !targetDriverObj.isOnline) {
+          console.log(`[DIAGNOSTIC] Selected driver (${validDriverId}) is offline. Rejecting with 409.`);
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'driver_unavailable',
+              message: 'This driver is currently offline.',
+              driverSelectionMode: 'specific',
+            },
+          };
+        }
+
+        const requestedTrans = body.transmission || body.customerVehicle?.transmission;
+        const requestedFuel = body.fuelType || body.customerVehicle?.fuel;
+        if (!isDriverVehicleCompatible(targetDriverObj, { transmission: requestedTrans, fuelType: requestedFuel })) {
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'driver_incompatible',
+              message: 'This driver is not compatible with your vehicle transmission or fuel type.',
+              driverSelectionMode: 'specific',
+            },
+          };
+        }
+
+        // Check if driver is already on an active ride
+        const activeRide = await tx.booking.findFirst({
+          where: {
+            driverId: validDriverId,
+            status: { in: ['accepted', 'driver_arriving', 'arrived', 'in_progress', 'awaiting_payment'] },
+          },
+        });
+
+        if (activeRide) {
+          console.log(`[DIAGNOSTIC] Selected driver (${validDriverId}) is busy on ride ${activeRide.id}. Rejecting with 409.`);
+          return {
+            errorStatus: 409,
+            payload: {
+              error: 'driver_busy',
+              message: 'This driver is currently on another ride.',
+              driverSelectionMode: 'specific',
+            },
+          };
+        }
+      }
+
+      const created = await tx.booking.create({
+        data: {
+          refCode: effectiveRefCode,
+          bookingChannel: body.bookingChannel || (isRental ? 'rental' : 'website'),
+          selectedDriverExclusive: isWebsiteDriverExclusive,
+          customerId: validCustomerId,
+          customerName,
+          customerPhone,
+          passengerName: passengerName || customerName,
+          passengerPhone: passengerPhone || customerPhone,
+          bookingFor: body.bookingFor || 'myself',
+          passengerRelationship: body.passengerRelationship || undefined,
+          passengerSpecialInstructions: body.passengerSpecialInstructions || undefined,
+          serviceType: normalizedServiceType,
+          vehicleCategory: vehicleCategory === 'auto' ? 'auto' : (vehicleCategory === 'ev' ? 'ev' : vehicleCategory),
+          transmission: body.transmission || body.customerVehicle?.transmission || undefined,
+          fuelType: body.fuelType || body.customerVehicle?.fuel || undefined,
+          customerVehicle: body.customerVehicle || undefined,
+          pickupLocation,
+          destinationLocation: effectiveDest,
+          stops: stops ?? [],
+          scheduledDate,
+          scheduledTime,
+          isRoundTrip: Boolean(isRoundTrip),
+          returnDate,
+          returnTime,
+          durationHours,
+          flightTrainNumber,
+          medicalNotes,
+          hospitalNotes,
+          tourItineraryNotes,
+          tourNotes,
+          fareBreakdown,
+          rideStartOtp: effectiveOtp,
+          driverId: validDriverId,
+          driverName: (targetDriverObj?.name || driverName) || undefined,
+          driverPhone: (targetDriverObj?.phone || driverPhone) || undefined,
+          driverVehicle: (targetDriverObj?.vehicleModel || driverVehicle) || undefined,
+          driverRating: typeof (targetDriverObj?.ratingAverage || driverRating) === 'number' ? (targetDriverObj?.ratingAverage || driverRating) : undefined,
+          favouriteDriverId: driverSelectionMode === 'favourite' ? (body.favouriteDriverId || validDriverId) : null,
+          requestedDriverName: body.requestedDriverName || targetDriverObj?.name || driverName || undefined,
+          requestQueueStatus: effectiveQueueStatus,
+          exclusiveUntil: driverSelectionMode === 'favourite' ? new Date(Date.now() + 60 * 1000) : null,
+          pricingModel,
+          declinedDriverIds: [],
+          paymentMethod: paymentMethod ?? 'cash',
+          emergencyContact,
+          status: 'pending',
+          paymentStatus: 'pending',
+          rentalVehicleId: rentalVehicleId || undefined,
+          rentalVehicleModel: rentalVehicleModel || undefined,
+          advanceAmount: typeof advanceAmount === 'number' ? advanceAmount : (fareBreakdown?.advanceAmount ?? undefined),
+          remainingAmount: typeof remainingAmount === 'number' ? remainingAmount : (fareBreakdown?.remainingAmount ?? undefined),
+          advancePaid: isRental ? true : false,
+          advancePaidAt: isRental ? new Date() : undefined,
+          notificationMessage: isRental
+            ? 'New self-drive rental reservation submitted. Pending Admin Approval.'
+            : undefined,
+        },
+      });
+
+      return { booking: created };
     });
+
+    if ('errorStatus' in txResult && txResult.errorStatus) {
+      return NextResponse.json(txResult.payload, { status: txResult.errorStatus });
+    }
+
+    const booking = txResult.booking!;
 
     console.log(`[DIAGNOSTIC] Booking created in PostgreSQL: ID=${booking.id}, RefCode=${booking.refCode}, DriverId=${booking.driverId || 'None (Broadcast)'}, QueueStatus=${booking.requestQueueStatus}, Channel=${booking.bookingChannel}`);
 

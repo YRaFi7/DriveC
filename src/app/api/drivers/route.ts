@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { validateMobileNumber } from '@/lib/validation';
 
 // GET /api/drivers
 // ?status=approved|pending|rejected|suspended  (filter by approvalStatus)
@@ -46,6 +47,10 @@ export async function POST(req: NextRequest) {
 
     if (!name || !phone || !licenseNumber) {
       return NextResponse.json({ error: 'Name, phone, and commercial driving license number are required' }, { status: 400 });
+    }
+    const phoneErr = validateMobileNumber(String(phone));
+    if (phoneErr) {
+      return NextResponse.json({ error: phoneErr }, { status: 400 });
     }
 
     const driverEmail = email || `${phone.replace(/\D/g, '')}@drivec.in`;

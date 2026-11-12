@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from 'react';
+import { validateMobileNumber } from '../lib/validation';
 import { 
   MapPin, 
   Navigation, 
@@ -43,15 +44,19 @@ interface BookingEngineProps {
     vehicles?: CustomerVehicle[];
   };
   onOpenGuestWarning: (actionName?: string) => void;
-  onBookingCreated: (booking: Booking) => Promise<{ success: boolean; booking?: Booking; error?: string; errorCode?: string; mode?: string }> | void;
-  onCancelBooking?: (bookingId: string) => void;
+  onBookingCreated: (booking: Booking) => Promise<{ success: boolean; booking?: Booking; activeBooking?: Booking; error?: string; errorCode?: string; mode?: string }> | void;
+  onCancelBooking?: (bookingId: string) => Promise<void> | void;
   approvedDrivers: Driver[];
   rentalVehicles?: RentalVehicle[];
   bookings?: Booking[];
   favouriteDriverIds?: string[];
   onToggleFavouriteDriver?: (driverId: string) => void;
   onNavigateToPortal?: (tab: string) => void;
-  onPassengerPayment?: (bookingId: string, paymentMethod: 'cash' | 'upi' | 'card') => Promise<void> | void;
+  onPassengerPayment?: (
+    bookingId: string,
+    paymentMethod: 'cash' | 'upi' | 'card',
+    options?: { cashHandedConfirmed?: boolean; gatewayVerified?: boolean; gatewayPaymentId?: string }
+  ) => Promise<void> | void;
 }
 
 export const BookingEngine: React.FC<BookingEngineProps> = ({
@@ -670,7 +675,19 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
     isSuccess: false,
   });
   const [isSubmittingPayment, setIsSubmittingPayment] = useState(false);
+  const [cashHandedConfirmed, setCashHandedConfirmed] = useState(false);
+  const [paymentError, setPaymentError] = useState('');
   const dismissedPaymentBookingIds = useRef<Set<string>>(new Set());
+  const dismissedDeclinedBookingIds = useRef<Set<string>>(new Set());
+
+  // Duplicate Booking Prevention States
+  const [isSubmittingBooking, setIsSubmittingBooking] = useState(false);
+  const isSubmittingBookingRef = useRef(false);
+  const [alreadyBookedModal, setAlreadyBookedModal] = useState<{
+    isOpen: boolean;
+    booking: Booking | null;
+  }>({ isOpen: false, booking: null });
+  const [isCancellingExistingBooking, setIsCancellingExistingBooking] = useState(false);
 
   // 20-Second Cancellation Countdown Window (Requirement 4)
   const [cancelSecondsLeft, setCancelSecondsLeft] = useState<number>(20);
@@ -686,44 +703,51 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
         if (live) {
           setActiveCreatedBooking(live);
           if (live.status === 'declined' || (live.status === 'cancelled' && live.cancelledBy === 'driver')) {
-            const isFav = Boolean(live.favouriteDriverId || live.requestQueueStatus === 'exclusive_favourite' || (live as any).driverSelectionMode === 'favourite');
-            setDriverModalState({
-              isOpen: true,
-              mode: isFav ? 'favourite' : 'specific',
-              type: 'declined',
-              message: 'Driver has declined your request.',
-              driverName: live.driverName,
-              bookingRef: live.refCode,
-              bookingId: live.id,
-            });
+            if (!dismissedDeclinedBookingIds.current.has(live.id)) {
+              const isFav = Boolean(live.favouriteDriverId || live.requestQueueStatus === 'exclusive_favourite' || (live as any).driverSelectionMode === 'favourite');
+              setDriverModalState({
+                isOpen: true,
+                mode: isFav ? 'favourite' : 'specific',
+                type: 'declined',
+                message: 'Driver has declined your request.',
+                driverName: live.driverName,
+                bookingRef: live.refCode,
+                bookingId: live.id,
+              });
+            }
           }
-          // When driver reaches destination, auto-open payment modal if not already paid
-          if (live.status === 'completed' && !live.passengerPaid && live.serviceType !== 'self-drive') {
+          // When driver reaches destination (awaiting_payment or completed unpaid), auto-open payment modal
+          if ((live.status === 'awaiting_payment' || live.status === 'completed') && !live.passengerPaid && live.serviceType !== 'self-drive') {
             if (!dismissedPaymentBookingIds.current.has(live.id) && !ridePaymentModal.isOpen) {
+              setCashHandedConfirmed(false);
+              setPaymentError('');
               setRidePaymentModal({
                 isOpen: true,
                 booking: live,
-                paymentMethod: 'upi',
+                paymentMethod: 'cash',
                 isSuccess: false,
               });
             }
           }
         }
       } else if (currentUser.role !== 'guest') {
-        // If no active booking in local state, find any ongoing or completed unpaid ride for customer
+        // If no active booking in local state, find any ongoing or awaiting-payment unpaid ride for customer
         const liveUnpaid = bookings.find(b =>
           (b.customerId === currentUser.id || (Boolean(currentUser.phone) && b.customerPhone === currentUser.phone)) &&
-          ['pending', 'accepted', 'driver_arriving', 'arrived', 'in_progress', 'completed'].includes(b.status) &&
+          ['pending', 'accepted', 'driver_arriving', 'arrived', 'in_progress', 'awaiting_payment', 'completed'].includes(b.status) &&
           !b.passengerPaid &&
-          b.serviceType !== 'self-drive'
+          b.serviceType !== 'self-drive' &&
+          !b.rentalVehicleId
         );
         if (liveUnpaid) {
           setActiveCreatedBooking(liveUnpaid);
-          if (liveUnpaid.status === 'completed' && !dismissedPaymentBookingIds.current.has(liveUnpaid.id) && !ridePaymentModal.isOpen) {
+          if ((liveUnpaid.status === 'awaiting_payment' || liveUnpaid.status === 'completed') && !dismissedPaymentBookingIds.current.has(liveUnpaid.id) && !ridePaymentModal.isOpen) {
+            setCashHandedConfirmed(false);
+            setPaymentError('');
             setRidePaymentModal({
               isOpen: true,
               booking: liveUnpaid,
-              paymentMethod: 'upi',
+              paymentMethod: 'cash',
               isSuccess: false,
             });
           }
@@ -817,28 +841,40 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
     return transOk && fuelOk;
   });
 
-  // Display matched drivers (or all approved as fallback if none match exactly)
-  const displayedDrivers = capabilityMatchedDrivers.length > 0 ? capabilityMatchedDrivers : allApprovedDrivers;
-  const sortedApprovedDrivers = [...displayedDrivers].sort((a, b) => (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0));
+  // Always include every online approved driver while keeping capability-matched drivers prioritized
+  const capabilityMatchedIds = new Set(capabilityMatchedDrivers.map(d => d.id));
+  const displayedDrivers = capabilityMatchedDrivers.length > 0
+    ? allApprovedDrivers.filter(d => d.isOnline || capabilityMatchedIds.has(d.id))
+    : allApprovedDrivers;
+  const sortedApprovedDrivers = [...displayedDrivers].sort((a, b) => {
+    const onlineDiff = (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0);
+    if (onlineDiff !== 0) return onlineDiff;
+    return (capabilityMatchedIds.has(b.id) ? 1 : 0) - (capabilityMatchedIds.has(a.id) ? 1 : 0);
+  });
   const matchedDrivers = sortedApprovedDrivers;
   const availableOnlineDrivers = sortedApprovedDrivers.filter(d => d.isOnline);
-  const customerFavDrivers = sortedApprovedDrivers.filter(d => favouriteDriverIds.includes(d.id));
+  const availableCompatibleOnlineDrivers = sortedApprovedDrivers.filter(d => d.isOnline && capabilityMatchedIds.has(d.id));
+  const customerFavDrivers = allApprovedDrivers.filter(d => favouriteDriverIds.includes(d.id));
 
-  // Section 4: Auto-select driver based on favourites
-  // - 1 favourite: pre-select that driver
-  // - Multiple favourites: pre-select first favourite
-  // - 0 favourites: pre-select first available online compatible driver
+  // Auto-select only an online compatible driver; clear selection if selected driver is offline or incompatible
   useEffect(() => {
+    const onlineCompatibleFavs = customerFavDrivers.filter(d => d.isOnline && capabilityMatchedIds.has(d.id));
+    const currentSelected = sortedApprovedDrivers.find(d => d.id === selectedDriverId);
+
     if (!selectedDriverId) {
-      if (customerFavDrivers.length >= 1) {
-        handleDriverChange(customerFavDrivers[0].id);
-      } else if (availableOnlineDrivers.length > 0) {
-        handleDriverChange(availableOnlineDrivers[0].id);
-      } else if (sortedApprovedDrivers.length > 0) {
-        handleDriverChange(sortedApprovedDrivers[0].id);
+      if (onlineCompatibleFavs.length >= 1) {
+        handleDriverChange(onlineCompatibleFavs[0].id);
+      } else if (availableCompatibleOnlineDrivers.length > 0) {
+        handleDriverChange(availableCompatibleOnlineDrivers[0].id);
       }
+    } else if (
+      currentSelected &&
+      (!currentSelected.isOnline || !capabilityMatchedIds.has(currentSelected.id)) &&
+      driverSelectionMode === 'specific'
+    ) {
+      handleDriverChange(availableCompatibleOnlineDrivers[0]?.id || '');
     }
-  }, [customerFavDrivers, availableOnlineDrivers, sortedApprovedDrivers, selectedDriverId]);
+  }, [customerFavDrivers, availableCompatibleOnlineDrivers, sortedApprovedDrivers, selectedDriverId, driverSelectionMode]);
 
   // Promo code apply (Requirement 2: 50% discount strictly for each customer's first completed ride)
   const handleApplyPromo = () => {
@@ -936,6 +972,11 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
         setDriverErrorMsg('Please enter the passenger mobile number.');
         return;
       }
+      const otherPhoneErr = validateMobileNumber(otherPhone);
+      if (otherPhoneErr) {
+        setDriverErrorMsg(otherPhoneErr);
+        return;
+      }
     }
 
     setDriverErrorMsg('');
@@ -972,13 +1013,12 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
     let targetFavId: string | undefined = undefined;
 
     if (isFavMode) {
-      chosenDriver = customerFavDrivers.find(d => d.id === selectedDriverId) || customerFavDrivers[0] || null;
+      const onlineCompatibleFavs = customerFavDrivers.filter(d => d.isOnline && capabilityMatchedIds.has(d.id));
+      chosenDriver = onlineCompatibleFavs.find(d => d.id === selectedDriverId) || onlineCompatibleFavs[0] || null;
       targetFavId = chosenDriver?.id;
     } else if (isSpecificMode) {
-      chosenDriver = matchedDrivers.find(d => d.id === selectedDriverId) ||
-        sortedApprovedDrivers.find(d => d.id === selectedDriverId) ||
-        availableOnlineDrivers[0] ||
-        approvedDrivers[0] || null;
+      chosenDriver = availableCompatibleOnlineDrivers.find(d => d.id === selectedDriverId) ||
+        availableCompatibleOnlineDrivers[0] || null;
     }
 
     const preferredDriverName = chosenDriver?.name || 'Any Available';
@@ -1142,6 +1182,33 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
     }
 
     if (bookingMode === 'driver_booking') {
+      // Prevent concurrent in-flight duplicate submission on rapid double-click
+      if (isSubmittingBookingRef.current) {
+        return;
+      }
+
+      // Check for an existing active driver booking for this customer (unless retrying with random drivers after decline)
+      if (!modeOverride) {
+        const activeStatuses = ['pending', 'approved', 'accepted', 'driver_arriving', 'arrived', 'in_progress', 'awaiting_payment'];
+        const existingFromState = activeCreatedBooking &&
+          activeStatuses.includes(activeCreatedBooking.status) &&
+          activeCreatedBooking.serviceType !== 'self-drive' &&
+          !activeCreatedBooking.rentalVehicleId
+            ? activeCreatedBooking
+            : null;
+        const existingFromList = bookings.find(b =>
+          (b.customerId === currentUser.id || (Boolean(currentUser.phone) && b.customerPhone === currentUser.phone)) &&
+          activeStatuses.includes(b.status) &&
+          b.serviceType !== 'self-drive' &&
+          !b.rentalVehicleId
+        );
+        const existingActive = existingFromState || existingFromList || null;
+        if (existingActive) {
+          setAlreadyBookedModal({ isOpen: true, booking: existingActive });
+          return;
+        }
+      }
+
       // Vehicle validation: Must have a vehicle selected
       if (!selectedVehicle && !carModel && vehicles.length === 0) {
         setDriverErrorMsg('Please register or select your vehicle before booking.');
@@ -1185,6 +1252,11 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
           setDriverErrorMsg('Please enter passenger mobile number.');
           return;
         }
+        const otherPhoneErr = validateMobileNumber(otherPhone);
+        if (otherPhoneErr) {
+          setDriverErrorMsg(otherPhoneErr);
+          return;
+        }
       }
 
       // Must have matched driver
@@ -1203,21 +1275,20 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
       let targetFavId: string | undefined = undefined;
 
       if (isFavMode) {
-        chosenDriver = customerFavDrivers.find(d => d.id === selectedDriverId) || customerFavDrivers[0];
+        const onlineCompatibleFavs = customerFavDrivers.filter(d => d.isOnline && capabilityMatchedIds.has(d.id));
+        chosenDriver = onlineCompatibleFavs.find(d => d.id === selectedDriverId) || onlineCompatibleFavs[0] || null;
         if (!chosenDriver) {
-          setDriverErrorMsg('No favourite driver found. Please pick a driver or select Random Drivers.');
+          setDriverErrorMsg(`Your favourite driver is offline or not compatible with your ${activeTransmission.toUpperCase()} ${activeFuel.toUpperCase()} vehicle. Please select a compatible online driver or choose Random Drivers.`);
           return;
         }
         targetFavId = chosenDriver.id;
       } else if (isSpecificMode) {
-        chosenDriver = matchedDrivers.find(d => d.id === selectedDriverId) || 
-          sortedApprovedDrivers.find(d => d.id === selectedDriverId) || 
-          availableOnlineDrivers[0] || 
-          matchedDrivers[0] || 
-          approvedDrivers[0];
+        chosenDriver = availableCompatibleOnlineDrivers.find(d => d.id === selectedDriverId) ||
+          availableCompatibleOnlineDrivers[0] ||
+          null;
 
         if (!chosenDriver) {
-          setDriverErrorMsg(`No approved driver currently matches vehicle category "${selectedCategory.toUpperCase()}". Please choose another category.`);
+          setDriverErrorMsg(`No online driver is currently compatible with your ${activeTransmission.toUpperCase()} ${activeFuel.toUpperCase()} vehicle. Please select Random Drivers or update your vehicle.`);
           return;
         }
       } else {
@@ -1300,12 +1371,23 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
         createdAt: new Date().toISOString()
       };
 
+      isSubmittingBookingRef.current = true;
+      setIsSubmittingBooking(true);
       try {
         const res = await onBookingCreated(newBooking);
         if (res && !res.success) {
           const errCode = (res as any).errorCode || '';
           const errMsg = res.error || '';
           const returnedMode = (res as any).mode || activeMode;
+
+          if (errCode === 'ALREADY_BOOKED' || errCode === 'already_booked') {
+            const activeBk = (res as any).activeBooking || activeCreatedBooking || null;
+            if (activeBk) {
+              setActiveCreatedBooking(activeBk);
+            }
+            setAlreadyBookedModal({ isOpen: true, booking: activeBk });
+            return;
+          }
 
           if (returnedMode === 'favourite') {
             if (errCode === 'driver_busy' || errMsg.includes('another ride')) {
@@ -1364,6 +1446,9 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
       } catch (err: any) {
         const errText = err?.message || 'Failed to dispatch booking. Please retry.';
         setDriverErrorMsg(errText);
+      } finally {
+        isSubmittingBookingRef.current = false;
+        setIsSubmittingBooking(false);
       }
 
     } else {
@@ -2103,6 +2188,11 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                           className="w-full px-3 py-2 bg-[#0d1017] border border-[#262b36] rounded-xl text-xs font-medium text-slate-100 outline-none focus:border-[#002C6C] transition-all font-mono"
                         />
                       </div>
+                      {otherPhone.trim() && validateMobileNumber(otherPhone) && (
+                        <p className="mt-1 text-[11px] font-semibold text-rose-400">
+                          {validateMobileNumber(otherPhone)}
+                        </p>
+                      )}
                     </div>
 
                     {/* Passenger Relationship */}
@@ -2344,8 +2434,8 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                     }
                     setDriverErrorMsg('');
                     setHasSearchedDrivers(true);
-                    if (sortedApprovedDrivers.length > 0 && !selectedDriverId) {
-                      setSelectedDriverId(sortedApprovedDrivers[0].id);
+                    if (availableCompatibleOnlineDrivers.length > 0 && !selectedDriverId) {
+                      setSelectedDriverId(availableCompatibleOnlineDrivers[0].id);
                     }
                     setTimeout(() => {
                       document.getElementById('driver-selection-section')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2537,11 +2627,15 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                                 onChange={(e) => handleDriverChange(e.target.value)}
                                 className="w-full p-2 bg-[#0d1017] border border-[#262b36] rounded-lg text-xs font-semibold text-slate-100 outline-none focus:border-[#002C6C]"
                               >
-                                {customerFavDrivers.map(fd => (
-                                  <option key={fd.id} value={fd.id}>
-                                    {fd.name} ({fd.isOnline ? 'Online' : 'Offline'}) • ★ {fd.ratingAverage || '5.0'}
-                                  </option>
-                                ))}
+                                {customerFavDrivers.map(fd => {
+                                  const isCompat = capabilityMatchedIds.has(fd.id);
+                                  const canPick = fd.isOnline && isCompat;
+                                  return (
+                                    <option key={fd.id} value={fd.id} disabled={!canPick}>
+                                      {fd.name} ({!fd.isOnline ? 'Offline — Unavailable' : !isCompat ? 'Not Compatible' : 'Online'}) • ★ {fd.ratingAverage || '5.0'}
+                                    </option>
+                                  );
+                                })}
                               </select>
                               {isFavOffline && (
                                 <div className="p-2.5 bg-blue-950/40 border border-blue-900/60 rounded-lg text-cyan-300 text-xs font-bold flex items-center gap-2">
@@ -2587,17 +2681,26 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
 
                         <div className="space-y-2.5 max-h-72 overflow-y-auto pr-1">
                           {sortedApprovedDrivers.map((driver) => {
-                            const isChosen = (selectedDriverId === driver.id) || (!selectedDriverId && sortedApprovedDrivers[0]?.id === driver.id);
+                            const isOnline = Boolean(driver.isOnline);
+                            const isCompatible = capabilityMatchedIds.has(driver.id);
+                            const canSelect = isOnline && isCompatible;
+                            const isChosen = canSelect && ((selectedDriverId === driver.id) || (!selectedDriverId && availableCompatibleOnlineDrivers[0]?.id === driver.id));
                             const isFav = favouriteDriverIds.includes(driver.id);
 
                             return (
                               <div
                                 key={driver.id}
-                                onClick={() => setSelectedDriverId(driver.id)}
-                                className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
-                                  isChosen
-                                    ? 'border-[#002C6C] bg-[#1c2230] shadow-sm ring-1 ring-[#002C6C]'
-                                    : 'border-[#262b36] bg-[#0d1017] hover:border-slate-600 hover:bg-[#14171f]'
+                                onClick={() => {
+                                  if (!canSelect) return;
+                                  setSelectedDriverId(driver.id);
+                                }}
+                                aria-disabled={!canSelect}
+                                className={`p-3 rounded-xl border transition-all flex items-center justify-between gap-3 ${
+                                  !canSelect
+                                    ? 'border-[#262b36] bg-[#0d1017]/60 opacity-55 cursor-not-allowed'
+                                    : isChosen
+                                      ? 'border-[#002C6C] bg-[#1c2230] shadow-sm ring-1 ring-[#002C6C] cursor-pointer'
+                                      : 'border-[#262b36] bg-[#0d1017] hover:border-slate-600 hover:bg-[#14171f] cursor-pointer'
                                 }`}
                               >
                                 <div className="flex items-center gap-2.5">
@@ -2651,9 +2754,15 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                                   )}
 
                                   <span className={`px-2.5 py-1 rounded-lg text-[10px] font-black transition-all ${
-                                    isChosen ? 'bg-[#002C6C] text-white shadow-xs' : 'bg-[#14171f] text-slate-400 border border-[#262b36]'
+                                    !isOnline
+                                      ? 'bg-[#14171f] text-slate-500 border border-[#262b36]'
+                                      : !isCompatible
+                                        ? 'bg-amber-950/50 text-amber-300 border border-amber-800/70'
+                                        : isChosen
+                                          ? 'bg-[#002C6C] text-white shadow-xs'
+                                          : 'bg-[#14171f] text-slate-400 border border-[#262b36]'
                                   }`}>
-                                    {isChosen ? 'Selected ✓' : 'Select'}
+                                    {!isOnline ? 'Offline' : !isCompatible ? 'Not Compatible' : isChosen ? 'Selected ✓' : 'Select'}
                                   </span>
                                 </div>
                               </div>
@@ -2761,9 +2870,10 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 {/* Submit Booking */}
                 <button
                   type="submit"
-                  className="w-full py-4 rounded-2xl bg-[#002C6C] hover:bg-[#001f4d] text-white font-black text-sm shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99]"
+                  disabled={isSubmittingBooking}
+                  className="w-full py-4 rounded-2xl bg-[#002C6C] hover:bg-[#001f4d] disabled:opacity-60 disabled:cursor-not-allowed text-white font-black text-sm shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99]"
                 >
-                  <span>{t.booking.confirmBooking} (₹{fare.totalFare})</span>
+                  <span>{isSubmittingBooking ? 'Confirming Booking...' : `${t.booking.confirmBooking} (₹${fare.totalFare})`}</span>
                 </button>
 
                 <p className="text-[11px] text-slate-400 text-center">
@@ -3039,7 +3149,7 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                           Driver: {activeCreatedBooking.driverName || 'Matching nearby driver'}
                         </p>
                         {/* Requirement: Website Pay for Ride after Destination Reached */}
-                        {activeCreatedBooking.status === 'completed' && (
+                        {(activeCreatedBooking.status === 'awaiting_payment' || activeCreatedBooking.status === 'completed') && (
                           <div className="pt-2 border-t border-white/10 space-y-2">
                             {!activeCreatedBooking.passengerPaid ? (
                               <div className="p-3 bg-gradient-to-r from-emerald-950/90 to-blue-950/90 border border-emerald-700/80 rounded-xl space-y-2">
@@ -3052,15 +3162,17 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                                   </span>
                                 </div>
                                 <p className="text-[11px] text-slate-300">
-                                  Your driver has arrived at the destination. Please pay the ride fare to complete payment.
+                                  Your driver has arrived at the destination. Please choose Cash, Card, or UPI to complete payment.
                                 </p>
                                 <button
                                   type="button"
                                   onClick={() => {
+                                    setCashHandedConfirmed(false);
+                                    setPaymentError('');
                                     setRidePaymentModal({
                                       isOpen: true,
                                       booking: activeCreatedBooking,
-                                      paymentMethod: 'upi',
+                                      paymentMethod: 'cash',
                                       isSuccess: false,
                                     });
                                   }}
@@ -3532,6 +3644,9 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    if (driverModalState.bookingId) {
+                      dismissedDeclinedBookingIds.current.add(driverModalState.bookingId);
+                    }
                     setDriverModalState({ isOpen: false, mode: 'specific', type: 'busy', message: '' });
                     setDriverSelectionMode('specific');
                     setHasSearchedDrivers(true);
@@ -3546,6 +3661,9 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    if (driverModalState.bookingId) {
+                      dismissedDeclinedBookingIds.current.add(driverModalState.bookingId);
+                    }
                     setDriverModalState({ isOpen: false, mode: 'favourite', type: 'busy', message: '' });
                     handleConfirmRandomBroadcast();
                   }}
@@ -3559,6 +3677,9 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    if (driverModalState.bookingId) {
+                      dismissedDeclinedBookingIds.current.add(driverModalState.bookingId);
+                    }
                     setDriverModalState({ isOpen: false, mode: 'specific', type: 'busy', message: '' });
                     setDriverSelectionMode('specific');
                     setHasSearchedDrivers(true);
@@ -3572,6 +3693,21 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 </button>
               </div>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                if (driverModalState.bookingId) {
+                  dismissedDeclinedBookingIds.current.add(driverModalState.bookingId);
+                }
+                if (activeCreatedBooking && (activeCreatedBooking.status === 'declined' || (activeCreatedBooking.status === 'cancelled' && activeCreatedBooking.cancelledBy === 'driver'))) {
+                  setActiveCreatedBooking(null);
+                }
+                setDriverModalState({ isOpen: false, mode: 'specific', type: 'busy', message: '' });
+              }}
+              className="w-full py-2 rounded-xl bg-[#1c202a] hover:bg-[#252b38] text-slate-300 font-bold text-xs border border-[#262b36] transition-colors cursor-pointer"
+            >
+              Close
+            </button>
           </div>
         </div>
       )}
@@ -3881,11 +4017,15 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 <div className="space-y-2">
                   <label className="block text-xs font-bold text-slate-300">Choose Payment Method:</label>
                   <div className="grid grid-cols-3 gap-2">
-                    {(['upi', 'cash', 'card'] as const).map(method => (
+                    {(['cash', 'card', 'upi'] as const).map(method => (
                       <button
                         key={method}
                         type="button"
-                        onClick={() => setRidePaymentModal(prev => ({ ...prev, paymentMethod: method }))}
+                        onClick={() => {
+                          setCashHandedConfirmed(false);
+                          setPaymentError('');
+                          setRidePaymentModal(prev => ({ ...prev, paymentMethod: method }));
+                        }}
                         className={`py-2.5 px-2 rounded-xl border-2 font-bold text-xs flex flex-col items-center gap-1 transition-all cursor-pointer ${
                           ridePaymentModal.paymentMethod === method
                             ? 'border-[#002C6C] bg-[#002C6C] text-white shadow-sm'
@@ -3897,16 +4037,52 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                     ))}
                   </div>
 
-                  {ridePaymentModal.paymentMethod === 'upi' && (
-                    <div className="p-2.5 bg-[#0d1424] border border-blue-800/70 rounded-xl text-center text-xs space-y-1">
-                      <span className="text-[11px] font-bold text-cyan-300 block">UPI ID: drivec@icici</span>
-                      <span className="text-[10px] text-cyan-300">Scan & pay with GPay, PhonePe, Paytm, or BHIM</span>
+                  {ridePaymentModal.paymentMethod === 'cash' && (
+                    <div className="p-3 bg-emerald-950/50 border border-emerald-700/80 rounded-xl text-xs space-y-2.5">
+                      <div className="text-center space-y-1">
+                        <span className="text-[11px] font-bold text-emerald-200 block">Direct Cash to Driver</span>
+                        <span className="text-[10px] text-emerald-300">
+                          Please hand ₹{ridePaymentModal.booking.fareBreakdown.totalFare} directly to your driver, then confirm below.
+                        </span>
+                      </div>
+                      <label className="flex items-start gap-2.5 p-2.5 rounded-lg bg-[#0d1017]/80 border border-emerald-700/60 cursor-pointer text-left">
+                        <input
+                          type="checkbox"
+                          checked={cashHandedConfirmed}
+                          onChange={(e) => {
+                            setCashHandedConfirmed(e.target.checked);
+                            setPaymentError('');
+                          }}
+                          className="mt-0.5 rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 cursor-pointer"
+                        />
+                        <span className="text-[11px] font-semibold text-emerald-100 leading-snug">
+                          I confirm that I have handed ₹{ridePaymentModal.booking.fareBreakdown.totalFare} in cash to the driver.
+                        </span>
+                      </label>
                     </div>
                   )}
-                  {ridePaymentModal.paymentMethod === 'cash' && (
-                    <div className="p-2.5 bg-emerald-950/50 border border-emerald-700/80 rounded-xl text-center text-xs space-y-1">
-                      <span className="text-[11px] font-bold text-emerald-200 block">Direct Cash to Driver</span>
-                      <span className="text-[10px] text-emerald-300">Please pay ₹{ridePaymentModal.booking.fareBreakdown.totalFare} directly to your driver</span>
+
+                  {ridePaymentModal.paymentMethod === 'card' && (
+                    <div className="p-3 bg-[#0d1424] border border-blue-800/70 rounded-xl text-center text-xs space-y-1">
+                      <span className="text-[11px] font-bold text-cyan-300 block">Credit / Debit Card Payment</span>
+                      <span className="text-[10px] text-cyan-300/80">
+                        Pay ₹{ridePaymentModal.booking.fareBreakdown.totalFare} securely via Visa, Mastercard, or RuPay
+                      </span>
+                    </div>
+                  )}
+
+                  {ridePaymentModal.paymentMethod === 'upi' && (
+                    <div className="p-3 bg-[#0d1424] border border-blue-800/70 rounded-xl text-center text-xs space-y-1">
+                      <span className="text-[11px] font-bold text-cyan-300 block">UPI ID: drivec@icici</span>
+                      <span className="text-[10px] text-cyan-300/80">
+                        Pay ₹{ridePaymentModal.booking.fareBreakdown.totalFare} with GPay, PhonePe, Paytm, or BHIM
+                      </span>
+                    </div>
+                  )}
+
+                  {paymentError && (
+                    <div className="p-2.5 bg-rose-950/60 border border-rose-700/80 rounded-xl text-[11px] font-semibold text-rose-200">
+                      {paymentError}
                     </div>
                   )}
                 </div>
@@ -3915,44 +4091,56 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 <div className="flex flex-col sm:flex-row gap-2 pt-1">
                   <button
                     type="button"
-                    disabled={isSubmittingPayment}
+                    disabled={isSubmittingPayment || (ridePaymentModal.paymentMethod === 'cash' && !cashHandedConfirmed)}
                     onClick={async () => {
                       const b = ridePaymentModal.booking;
+                      const method = ridePaymentModal.paymentMethod;
                       if (!b) return;
+                      if (method === 'cash' && !cashHandedConfirmed) return;
                       setIsSubmittingPayment(true);
+                      setPaymentError('');
                       try {
+                        const options = method === 'cash' ? { cashHandedConfirmed: true } : undefined;
                         if (onPassengerPayment) {
-                          await onPassengerPayment(b.id, ridePaymentModal.paymentMethod);
+                          await onPassengerPayment(b.id, method, options);
                         } else {
-                          await fetch(`/api/bookings/${b.id}/status`, {
+                          const res = await fetch(`/api/bookings/${b.id}/status`, {
                             method: 'PATCH',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ passengerPaid: true, paymentMethod: ridePaymentModal.paymentMethod }),
+                            body: JSON.stringify({
+                              passengerPaid: true,
+                              paymentMethod: method,
+                              ...(options || {}),
+                            }),
                           });
+                          const data = await res.json().catch(() => ({}));
+                          if (!res.ok) {
+                            throw new Error(data.error || data.message || 'Payment confirmation failed');
+                          }
                         }
                         setActiveCreatedBooking(prev => prev ? {
                           ...prev,
                           passengerPaid: true,
                           paymentStatus: 'completed',
-                          paymentMethod: ridePaymentModal.paymentMethod,
+                          paymentMethod: method,
+                          status: 'completed',
                         } : null);
                         setRidePaymentModal(prev => ({ ...prev, isSuccess: true }));
-                      } catch (err) {
+                      } catch (err: any) {
                         console.error('Payment failed:', err);
+                        setPaymentError(err?.message || 'Failed to confirm payment.');
                       } finally {
                         setIsSubmittingPayment(false);
                       }
                     }}
-                    className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99] text-white font-black text-xs shadow-md transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99] text-white font-black text-xs shadow-md transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {isSubmittingPayment ? (
-                      <>
-                        <span>Processing Payment...</span>
-                      </>
+                      <span>Processing Payment...</span>
+                    ) : ridePaymentModal.paymentMethod === 'cash' ? (
+                      <span>Confirm Cash Handed (₹{ridePaymentModal.booking.fareBreakdown.totalFare})</span>
                     ) : (
-                      <>
-                        <span>Pay ₹{ridePaymentModal.booking.fareBreakdown.totalFare} for Ride</span>
-                      </>
+                      <span>Pay ₹{ridePaymentModal.booking.fareBreakdown.totalFare} via {ridePaymentModal.paymentMethod.toUpperCase()}</span>
                     )}
                   </button>
                   <button
@@ -3970,6 +4158,79 @@ export const BookingEngine: React.FC<BookingEngineProps> = ({
                 </div>
               </>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* ALREADY BOOKED CONFIRMATION MODAL */}
+      {alreadyBookedModal.isOpen && (
+        <div className="fixed inset-0 bg-black/65 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in">
+          <div className="bg-[#14171f] rounded-2xl p-6 max-w-md w-full shadow-2xl border border-[#262b36] space-y-4 text-slate-100">
+            <div className="space-y-1.5 text-center">
+              <span className="inline-block px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-950/70 text-amber-300 border border-amber-700/80">
+                Active Booking Exists
+              </span>
+              <h3 className="text-lg font-black text-slate-100">
+                Already Booked
+              </h3>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                You have already booked. Do you want to cancel the ride and look for another driver?
+              </p>
+              {alreadyBookedModal.booking && (
+                <div className="mt-2 p-2.5 bg-[#0d1017] rounded-xl border border-[#262b36] text-[11px] text-slate-300 flex items-center justify-between">
+                  <span>Ref: <strong className="font-mono text-white">{alreadyBookedModal.booking.refCode}</strong></span>
+                  <span className="uppercase font-bold text-cyan-300">{alreadyBookedModal.booking.status.replace('_', ' ')}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2.5 pt-1">
+              <button
+                type="button"
+                disabled={isCancellingExistingBooking}
+                onClick={async () => {
+                  const targetBooking = alreadyBookedModal.booking || activeCreatedBooking;
+                  if (!targetBooking) {
+                    setAlreadyBookedModal({ isOpen: false, booking: null });
+                    setActiveCreatedBooking(null);
+                    return;
+                  }
+                  setIsCancellingExistingBooking(true);
+                  try {
+                    if (onCancelBooking) {
+                      await onCancelBooking(targetBooking.id);
+                    } else {
+                      await fetch(`/api/bookings/${targetBooking.id}/status`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          status: 'cancelled',
+                          cancelledBy: 'customer',
+                          cancellationReason: 'Customer cancelled to look for another driver',
+                        }),
+                      });
+                    }
+                    setActiveCreatedBooking(null);
+                    setAlreadyBookedModal({ isOpen: false, booking: null });
+                  } catch (err) {
+                    console.error('Failed to cancel existing booking:', err);
+                  } finally {
+                    setIsCancellingExistingBooking(false);
+                  }
+                }}
+                className="flex-1 py-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-black text-xs shadow-md transition-all cursor-pointer"
+              >
+                {isCancellingExistingBooking ? 'Cancelling...' : 'Cancel Ride'}
+              </button>
+              <button
+                type="button"
+                disabled={isCancellingExistingBooking}
+                onClick={() => setAlreadyBookedModal({ isOpen: false, booking: null })}
+                className="flex-1 py-3 rounded-xl bg-[#002C6C] hover:bg-[#001f4d] text-white font-black text-xs shadow-md transition-all cursor-pointer"
+              >
+                Keep Current Booking
+              </button>
+            </div>
           </div>
         </div>
       )}

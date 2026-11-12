@@ -136,14 +136,54 @@ export async function PATCH(
       });
     }
 
-    // ── Requirement 2: Disallow Cancelling Completed Rentals ──────────────────
-    if (status === 'cancelled') {
-      if (existingBooking.status === 'completed') {
-        return NextResponse.json({ error: 'Cannot cancel a completed rental' }, { status: 400 });
+    // ── Requirement 2: Disallow Cancelling Completed Rentals & Atomic Cancellation ──
+    if (status === 'cancelled' && cancelledBy !== 'driver') {
+      const cancelResult = await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'booking_customer_' + existingBooking.customerId}))`;
+        const fresh = await tx.booking.findUnique({ where: { id } });
+        if (!fresh) {
+          return { error: 'Booking not found', status: 404 };
+        }
+        if (fresh.status === 'completed') {
+          return { error: 'Cannot cancel a completed ride or rental', status: 400 };
+        }
+        if (fresh.status === 'cancelled') {
+          return { error: 'Booking is already cancelled', status: 400 };
+        }
+
+        const cancelData: Record<string, unknown> = {
+          status: 'cancelled',
+          rideStartOtp: 'CANCELLED', // Invalidate OTP so driver can never start a cancelled ride
+          cancelledBy: cancelledBy || 'customer',
+          cancellationReason: cancellationReason || 'Cancelled by customer',
+        };
+
+        const advance = fresh.advanceAmount ?? (fresh.fareBreakdown as any)?.advanceAmount ?? 0;
+        if (advance > 0) {
+          const fee = Math.round(advance * 0.20); // 20% cancellation fee
+          const refund = advance - fee;          // 80% refund to original payment method
+          cancelData.cancellationFee = fee;
+          cancelData.refundAmount = refund;
+          cancelData.paymentStatus = 'refunded';
+          cancelData.notificationMessage = `Refund of ₹${refund} (80% of advance amount) has been processed. Cancellation fee: ₹${fee} (20%).`;
+        }
+
+        const updated = await tx.booking.update({
+          where: { id },
+          data: cancelData,
+          include: { driver: true, customer: true },
+        });
+        return { booking: updated, status: 200 };
+      });
+
+      if ('error' in cancelResult && cancelResult.error) {
+        return NextResponse.json({ error: cancelResult.error }, { status: cancelResult.status });
       }
-      if (existingBooking.status === 'cancelled') {
-        return NextResponse.json({ error: 'Booking is already cancelled' }, { status: 400 });
-      }
+      return NextResponse.json({
+        success: true,
+        booking: cancelResult.booking,
+        message: 'Booking cancelled successfully.',
+      });
     }
 
     // ── Customer Action: Accept Random Drivers ──
@@ -319,6 +359,12 @@ export async function PATCH(
 
     // ── OTP Verification for Starting Ride ────────────────────────────────────
     if (status === 'in_progress') {
+      if (existingBooking.status === 'cancelled' || existingBooking.rideStartOtp === 'CANCELLED') {
+        return NextResponse.json(
+          { error: 'This booking has been cancelled and can no longer be started.', code: 'BOOKING_CANCELLED' },
+          { status: 409 }
+        );
+      }
       if (!enteredOtp || (enteredOtp.trim() !== existingBooking.rideStartOtp.trim() && enteredOtp.trim() !== '1234')) {
         console.warn(`[DIAGNOSTIC] Invalid OTP attempt for Booking ${id}. Provided OTP does not match.`);
         return NextResponse.json(
@@ -329,17 +375,203 @@ export async function PATCH(
       console.log(`[DIAGNOSTIC] Valid OTP verified for Booking ${id}. Transitioning to in_progress.`);
     }
 
+    // ── Driver "Destination Reached – Complete Ride" -> Awaiting Customer Payment ──
+    if (status === 'awaiting_payment') {
+      const arrivalResult = await prisma.$transaction(async (tx) => {
+        const fresh = await tx.booking.findUnique({ where: { id } });
+        if (!fresh) {
+          return { error: 'Booking not found', code: 'NOT_FOUND', status: 404 };
+        }
+        if (fresh.status === 'awaiting_payment' || fresh.status === 'completed') {
+          return {
+            error: 'Ride is already awaiting customer payment or completed.',
+            code: fresh.status === 'completed' ? 'ALREADY_COMPLETED' : 'ALREADY_AWAITING_PAYMENT',
+            booking: fresh,
+            status: 409,
+          };
+        }
+        if (fresh.status !== 'in_progress') {
+          return {
+            error: 'Ride must be in progress before marking destination reached.',
+            code: 'INVALID_TRANSITION',
+            status: 400,
+          };
+        }
+
+        const arrivalData: Record<string, unknown> = {
+          status: 'awaiting_payment',
+        };
+        if (body.actualDistanceKm !== undefined) {
+          arrivalData.actualDistanceKm = body.actualDistanceKm;
+        } else if ((fresh.fareBreakdown as any)?.distanceKm) {
+          arrivalData.actualDistanceKm = (fresh.fareBreakdown as any).distanceKm;
+        }
+        if (body.actualDurationMinutes !== undefined) {
+          arrivalData.actualDurationMinutes = body.actualDurationMinutes;
+        } else if ((fresh.fareBreakdown as any)?.durationMinutes) {
+          arrivalData.actualDurationMinutes = (fresh.fareBreakdown as any).durationMinutes;
+        }
+
+        const updated = await tx.booking.update({
+          where: { id },
+          data: arrivalData,
+          include: { driver: true, customer: true },
+        });
+        return { booking: updated, status: 200 };
+      });
+
+      if ('error' in arrivalResult && arrivalResult.error) {
+        return NextResponse.json(
+          { error: arrivalResult.error, code: arrivalResult.code, booking: arrivalResult.booking },
+          { status: arrivalResult.status }
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        booking: arrivalResult.booking,
+        message: 'Destination reached. Awaiting customer payment.',
+      });
+    }
+
+    // ── Customer Payment Confirmation (Driver Ride) ───────────────────────────
+    if (passengerPaid && !remainingPaid) {
+      const method = (paymentMethod || existingBooking.paymentMethod || 'cash') as 'cash' | 'card' | 'upi';
+      if (!['cash', 'card', 'upi'].includes(method)) {
+        return NextResponse.json({ error: 'Invalid payment method' }, { status: 400 });
+      }
+
+      if (method === 'cash' && body.cashHandedConfirmed !== true) {
+        return NextResponse.json(
+          {
+            error: 'Please confirm that the cash fare has been handed to the driver.',
+            code: 'CASH_CONFIRMATION_REQUIRED',
+          },
+          { status: 400 }
+        );
+      }
+
+      const payResult = await prisma.$transaction(async (tx) => {
+        const fresh = await tx.booking.findUnique({ where: { id } });
+        if (!fresh) {
+          return { error: 'Booking not found', code: 'NOT_FOUND', status: 404 };
+        }
+        if (fresh.status === 'cancelled') {
+          return { error: 'Cannot pay for a cancelled ride.', code: 'BOOKING_CANCELLED', status: 400 };
+        }
+        if (fresh.passengerPaid || fresh.paymentStatus === 'completed' || fresh.status === 'completed') {
+          return {
+            error: 'Payment for this ride has already been confirmed.',
+            code: 'ALREADY_PAID',
+            booking: fresh,
+            status: 409,
+          };
+        }
+        if (fresh.status !== 'awaiting_payment') {
+          return {
+            error: 'Ride must be awaiting customer payment before confirming payment.',
+            code: 'INVALID_PAYMENT_STATE',
+            status: 400,
+          };
+        }
+
+        const fb = (fresh.fareBreakdown as Record<string, any>) || {};
+        const totalFare = fb.totalFare || 0;
+        const baseSalary = Math.round(totalFare * 0.40);
+        const platformCommission = totalFare - baseSalary;
+        const txRef =
+          body.paymentTransactionRef ||
+          body.transactionRef ||
+          body.gatewayPaymentId ||
+          `PAY-${method.toUpperCase()}-${fresh.refCode}`;
+
+        let updatedDriverTotalTrips: number | undefined;
+        if (fresh.driverId) {
+          const updatedDrv = await tx.driver.update({
+            where: { id: fresh.driverId },
+            data: { totalTrips: { increment: 1 } },
+          });
+          updatedDriverTotalTrips = updatedDrv.totalTrips;
+        }
+
+        if (fresh.customerId) {
+          await tx.customer.updateMany({
+            where: { id: fresh.customerId },
+            data: { firstRidePromoUsed: true, firstRidePromoUsedAt: new Date() },
+          });
+        }
+        if (fresh.customerPhone) {
+          await tx.customer.updateMany({
+            where: { phone: fresh.customerPhone },
+            data: { firstRidePromoUsed: true, firstRidePromoUsedAt: new Date() },
+          });
+        }
+
+        const updated = await tx.booking.update({
+          where: { id },
+          data: {
+            passengerPaid: true,
+            passengerPaidAt: new Date(),
+            paymentStatus: 'completed',
+            paymentMethod: method,
+            paymentTransactionRef: txRef,
+            status: 'completed',
+            rideCompletedAt: fresh.rideCompletedAt || new Date(),
+            platformCommission,
+          },
+          include: { driver: true, customer: true },
+        });
+
+        return { booking: updated, driverTotalTrips: updatedDriverTotalTrips, status: 200 };
+      });
+
+      if ('error' in payResult && payResult.error) {
+        return NextResponse.json(
+          { error: payResult.error, code: payResult.code, booking: payResult.booking },
+          { status: payResult.status }
+        );
+      }
+
+      return NextResponse.json({
+        success: true,
+        booking: payResult.booking,
+        driverTotalTrips: payResult.driverTotalTrips,
+      });
+    }
+
+    // Block direct completion of driver rides without confirmed customer payment
+    const isSelfDriveRental =
+      existingBooking.serviceType === ('self_drive' as any) ||
+      Boolean(existingBooking.rentalVehicleId) ||
+      Boolean(remainingPaid);
+
+    if (status === 'completed' && !isSelfDriveRental) {
+      return NextResponse.json(
+        {
+          error: 'Customer payment confirmation is required before completing the ride. Mark destination reached (awaiting_payment) first.',
+          code: 'PAYMENT_REQUIRED',
+        },
+        { status: 400 }
+      );
+    }
+
     const data: Record<string, unknown> = {};
 
     if (status) {
-      const validStatuses = ['pending', 'approved', 'accepted', 'driver_arriving', 'arrived', 'in_progress', 'completed', 'cancelled', 'declined'];
+      const validStatuses = ['pending', 'approved', 'accepted', 'driver_arriving', 'arrived', 'in_progress', 'awaiting_payment', 'completed', 'cancelled', 'declined'];
       if (!validStatuses.includes(status)) {
         return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
       }
       data.status = status;
 
-      // Requirement 5: Ride Completion tracking
+      // Requirement 5: Ride Completion tracking (for self-drive rentals)
       if (status === 'completed') {
+        if (existingBooking.status === 'completed') {
+          return NextResponse.json(
+            { error: 'Booking is already completed.', code: 'ALREADY_COMPLETED', booking: existingBooking },
+            { status: 409 }
+          );
+        }
         data.rideCompletedAt = new Date();
         if (body.actualDistanceKm !== undefined) {
           data.actualDistanceKm = body.actualDistanceKm;
@@ -358,21 +590,8 @@ export async function PATCH(
         data.notificationMessage = 'Your vehicle has been successfully booked.';
       }
 
-      // Requirement 2: 80% refund of advance amount & 20% cancellation fee on cancellation
-      if (status === 'cancelled') {
-        const advance = existingBooking.advanceAmount ?? (existingBooking.fareBreakdown as any)?.advanceAmount ?? 0;
-        if (advance > 0) {
-          const fee = Math.round(advance * 0.20); // 20% cancellation fee
-          const refund = advance - fee;          // 80% refund to original payment method
-          data.cancellationFee = fee;
-          data.refundAmount = refund;
-          data.paymentStatus = 'refunded';
-          data.notificationMessage = `Refund of ₹${refund} (80% of advance amount) has been processed. Cancellation fee: ₹${fee} (20%).`;
-        }
-      }
-
-      // If ride completed, increment driver trip count
-      if (status === 'completed' && existingBooking.driverId) {
+      // If ride completed for the first time, increment driver trip count once
+      if (status === 'completed' && existingBooking.driverId && existingBooking.status !== 'completed') {
         await prisma.driver.update({
           where: { id: existingBooking.driverId },
           data: { totalTrips: { increment: 1 } },
@@ -389,6 +608,12 @@ export async function PATCH(
 
     // ── Remaining Rental Payment (Requirement 1) ─────────────────────────────
     if (remainingPaid) {
+      if (existingBooking.remainingPaid && existingBooking.status === 'completed') {
+        return NextResponse.json(
+          { error: 'Rental payment has already been completed.', code: 'ALREADY_PAID', booking: existingBooking },
+          { status: 409 }
+        );
+      }
       const rentTxRef: string = body.paymentTransactionRef || body.transactionRef || `PAY-RENT-${Date.now()}`;
       data.remainingPaid = true;
       data.remainingPaidAt = new Date();
@@ -409,15 +634,6 @@ export async function PATCH(
           paymentTransactionRef: rentTxRef
         }
       });
-    }
-
-    // ── Passenger Payment Completion ──────────────────────────────────────────
-    if (passengerPaid) {
-      data.passengerPaid = true;
-      data.passengerPaidAt = new Date();
-      data.paymentStatus = 'completed';
-      data.paymentTransactionRef = body.paymentTransactionRef || body.transactionRef || `PAY-RIDE-${Date.now()}`;
-      if (paymentMethod) data.paymentMethod = paymentMethod;
     }
 
     // ── Driver Salary Wallet Crediting (Strict Payment Verification) ─────────

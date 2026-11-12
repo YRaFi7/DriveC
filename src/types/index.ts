@@ -36,6 +36,7 @@ export type BookingStatus =
   | 'driver_arriving'
   | 'arrived'
   | 'in_progress'
+  | 'awaiting_payment'
   | 'completed'
   | 'cancelled'
   | 'declined';

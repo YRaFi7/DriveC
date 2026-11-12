@@ -3,6 +3,7 @@
 import React, { useState } from 'react';
 import { Language, User, Driver, VehicleCategory, RentalVehicle, TransmissionType, FuelType } from '../types';
 import { translations } from '../lib/translations';
+import { validateMobileNumber } from '../lib/validation';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -77,6 +78,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setErrorMsg('');
     if (!custName || !custPhone || !custEmail) {
       setErrorMsg('Please fill in your name, phone, and email.');
+      return;
+    }
+    const custPhoneErr = validateMobileNumber(custPhone);
+    if (custPhoneErr) {
+      setErrorMsg(custPhoneErr);
       return;
     }
     if (!custVehicleMakeModel.trim()) {
@@ -184,6 +190,11 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setErrorMsg('');
     if (!driverName || !driverPhone || !driverLicense) {
       setErrorMsg('Please enter your legal name, phone number, and commercial license number.');
+      return;
+    }
+    const driverPhoneErr = validateMobileNumber(driverPhone);
+    if (driverPhoneErr) {
+      setErrorMsg(driverPhoneErr);
       return;
     }
     if (driverTransmissions.length === 0) {
@@ -483,12 +494,17 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                         <input
                           type="tel"
                           required
-                          placeholder="+91 98460 12345"
+                          placeholder="9846012345"
                           value={custPhone}
                           onChange={(e) => setCustPhone(e.target.value)}
                           className="w-full px-3 py-2 border border-[#262b36] rounded-xl text-xs focus:ring-2 focus:ring-[#002C6C] outline-none"
                         />
                       </div>
+                      {custPhone.trim() && validateMobileNumber(custPhone) && (
+                        <p className="mt-1 text-[11px] font-semibold text-rose-400">
+                          {validateMobileNumber(custPhone)}
+                        </p>
+                      )}
                     </div>
                     <div>
                       <label className="block font-semibold text-slate-300 mb-1">{t.auth.email} *</label>
@@ -720,11 +736,16 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                       <input
                         type="tel"
                         required
-                        placeholder="+91 94471 22334"
+                        placeholder="9447122334"
                         value={driverPhone}
                         onChange={(e) => setDriverPhone(e.target.value)}
                         className="w-full px-3 py-2 border border-[#262b36] rounded-xl outline-none"
                       />
+                      {driverPhone.trim() && validateMobileNumber(driverPhone) && (
+                        <p className="mt-1 text-[11px] font-semibold text-rose-400">
+                          {validateMobileNumber(driverPhone)}
+                        </p>
+                      )}
                     </div>
                   </div>
 

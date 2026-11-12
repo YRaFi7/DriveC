@@ -42,7 +42,11 @@ interface UserPortalProps {
   onOpenReviewModalForBooking: (booking: Booking) => void;
   onSubmitReview?: (review: Review) => void;
   onFileComplaint: (complaint: Complaint) => void;
-  onPassengerPayment?: (bookingId: string, paymentMethod: 'cash' | 'upi' | 'card') => void;
+  onPassengerPayment?: (
+    bookingId: string,
+    paymentMethod: 'cash' | 'upi' | 'card',
+    options?: { cashHandedConfirmed?: boolean; gatewayVerified?: boolean; gatewayPaymentId?: string }
+  ) => Promise<void> | void;
   onUpdateBookingStatus?: (bookingId: string, status: Booking['status'], extra?: Record<string, unknown>) => void;
   onRequestRentalExtension?: (bookingId: string, requestedReturnDate: string, notes?: string) => Promise<any>;
   onPayRentalExtension?: (extensionId: string, paymentMethod: 'upi' | 'card' | 'cash') => Promise<any>;
@@ -134,8 +138,11 @@ export const UserPortal: React.FC<UserPortalProps> = ({
 
   // Payment Modal
   const [paymentModalBooking, setPaymentModalBooking] = useState<Booking | null>(null);
-  const [selectedPayMethod, setSelectedPayMethod] = useState<'cash' | 'upi' | 'card'>('upi');
+  const [selectedPayMethod, setSelectedPayMethod] = useState<'cash' | 'upi' | 'card'>('cash');
   const [paymentSuccessMsg, setPaymentSuccessMsg] = useState('');
+  const [cashHandedConfirmed, setCashHandedConfirmed] = useState(false);
+  const [paymentError, setPaymentError] = useState('');
+  const [isSubmittingPayment, setIsSubmittingPayment] = useState(false);
 
   // Review Modal State (Requirement 10: Customer can review driver)
   const [reviewModalBooking, setReviewModalBooking] = useState<Booking | null>(null);
@@ -147,6 +154,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
 
   // Driver Denied Alert Popup
   const [deniedBookingPopup, setDeniedBookingPopup] = useState<Booking | null>(null);
+  const dismissedDeniedBookingIds = React.useRef<Set<string>>(new Set());
 
   // Digital Receipt Modal
   const [selectedReceiptBooking, setSelectedReceiptBooking] = useState<Booking | null>(null);
@@ -259,19 +267,46 @@ export const UserPortal: React.FC<UserPortalProps> = ({
 
   const getClickableShareUrl = (rawUrl: string) => {
     if (!rawUrl) return '';
-    // Ensure localhost is replaced with 127.0.0.1 or LAN IP so WhatsApp/SMS turns it into a clickable blue link
-    if (rawUrl.includes('localhost:')) {
-      return rawUrl.replace('localhost:', '127.0.0.1:');
+    // Ensure localhost or raw IPv4 hosts have a domain suffix (nip.io) so WhatsApp/SMS render them as clickable hyperlinks
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.hostname === 'localhost') {
+        parsed.hostname = '127.0.0.1.nip.io';
+        return parsed.toString();
+      }
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(parsed.hostname)) {
+        parsed.hostname = `${parsed.hostname}.nip.io`;
+        return parsed.toString();
+      }
+    } catch {
+      if (rawUrl.includes('localhost:')) {
+        return rawUrl.replace('localhost:', '127.0.0.1.nip.io:');
+      }
     }
     return rawUrl;
   };
 
+  const buildShareMessage = (booking: Booking, rawUrl: string) => {
+    const clickableUrl = getClickableShareUrl(rawUrl);
+    const pilotVehicle = booking.driverVehicle ? ` (${booking.driverVehicle})` : '';
+    const pilotName = booking.driverName || 'Verified Chauffeur';
+
+    return [
+      `* Track my DriveC ride live in real-time!`,
+      `* Pickup: ${booking.pickupLocation}`,
+      `* Destination: ${booking.destinationLocation}`,
+      `* Pilot: ${pilotName}${pilotVehicle}`,
+      ``,
+      `* Free Live OpenStreetMap Route:`,
+      clickableUrl,
+      ``,
+      `Real-time tracking • No app download or login required.`
+    ].join('\n');
+  };
+
   const handleNativeShare = async () => {
     if (!shareUrl || !shareTripModalBooking) return;
-    const clickableUrl = getClickableShareUrl(shareUrl);
-    const pilotVehicle = shareTripModalBooking.driverVehicle ? ` (${shareTripModalBooking.driverVehicle})` : '';
-    const pilotName = shareTripModalBooking.driverName || 'Verified Chauffeur';
-    const shareMessage = `* Track my DriveC ride live in real-time!\n* Pickup: ${shareTripModalBooking.pickupLocation}\n* Destination: ${shareTripModalBooking.destinationLocation}\n* Pilot: ${pilotName}${pilotVehicle}\n\n* Free Live OpenStreetMap Route:\n${clickableUrl}\n\nReal-time tracking • No app download or login required.`;
+    const shareMessage = buildShareMessage(shareTripModalBooking, shareUrl);
 
     if (typeof navigator !== 'undefined' && (navigator as any).share) {
       try {
@@ -329,22 +364,27 @@ export const UserPortal: React.FC<UserPortalProps> = ({
   React.useEffect(() => {
     const denied = bookings.find(b => 
       (b.customerId === currentUser.id || b.customerPhone === currentUser.phone) && 
-      (b.status === 'declined' || (b.status === 'cancelled' && b.cancelledBy === 'driver'))
+      (b.status === 'declined' || (b.status === 'cancelled' && b.cancelledBy === 'driver')) &&
+      !dismissedDeniedBookingIds.current.has(b.id)
     );
     if (denied && !deniedBookingPopup) {
       setDeniedBookingPopup(denied);
     }
   }, [bookings, currentUser, deniedBookingPopup]);
 
-  // Requirement 5: Automatically show Final Fare Popup on Ride Completion
+  // Requirement 5: Automatically show Final Fare Popup on Destination Reached / Ride Completion
   React.useEffect(() => {
     const completedUnpaid = bookings.find(b =>
       (b.customerId === currentUser.id || b.customerPhone === currentUser.phone) &&
-      b.status === 'completed' &&
+      (b.status === 'awaiting_payment' || b.status === 'completed') &&
       !b.passengerPaid &&
-      b.serviceType !== 'self-drive'
+      b.serviceType !== 'self-drive' &&
+      !b.rentalVehicleId
     );
     if (completedUnpaid && !paymentModalBooking) {
+      setCashHandedConfirmed(false);
+      setPaymentError('');
+      setSelectedPayMethod('cash');
       setPaymentModalBooking(completedUnpaid);
     }
   }, [bookings, currentUser, paymentModalBooking]);
@@ -526,7 +566,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
   });
 
   const filteredBookings = searchedBookings.filter(b => {
-    if (filterStatus === 'active') return b.status === 'pending' || b.status === 'accepted' || b.status === 'driver_arriving' || b.status === 'arrived' || b.status === 'in_progress';
+    if (filterStatus === 'active') return b.status === 'pending' || b.status === 'accepted' || b.status === 'driver_arriving' || b.status === 'arrived' || b.status === 'in_progress' || b.status === 'awaiting_payment';
     if (filterStatus === 'completed') return b.status === 'completed';
     return true;
   });
@@ -826,6 +866,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
 
                         <span className={`text-[10px] font-bold uppercase px-2.5 py-0.5 rounded-full shrink-0 ${
                           b.status === 'completed' ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-800' :
+                          b.status === 'awaiting_payment' ? 'bg-amber-950/60 text-amber-300 border border-amber-700 animate-pulse' :
                           b.status === 'approved' ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-800' :
                           b.status === 'in_progress' ? 'bg-blue-950/60 text-cyan-300 border border-cyan-800 animate-pulse' :
                           b.status === 'driver_arriving' ? 'bg-cyan-950/60 text-cyan-300 border border-cyan-800 animate-pulse' :
@@ -1118,12 +1159,14 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                             </button>
                           )}
 
-                          {/* COMPLETE PAYMENT BUTTON IF COMPLETED AND UNPAID */}
-                          {b.status === 'completed' && !b.passengerPaid && (
+                          {/* COMPLETE PAYMENT BUTTON IF AWAITING PAYMENT OR COMPLETED AND UNPAID */}
+                          {(b.status === 'awaiting_payment' || b.status === 'completed') && !b.passengerPaid && !isRental && (
                             <button
                               onClick={() => {
                                 setPaymentModalBooking(b);
-                                setSelectedPayMethod(b.paymentMethod || 'upi');
+                                setSelectedPayMethod('cash');
+                                setCashHandedConfirmed(false);
+                                setPaymentError('');
                                 setPaymentSuccessMsg('');
                               }}
                               className="py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold flex items-center justify-center gap-1.5 shadow-xs"
@@ -1791,6 +1834,16 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                         </>
                       )}
                     </button>
+                    {shareUrl && (
+                      <a
+                        href={getClickableShareUrl(shareUrl)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center gap-1 shadow-xs transition-all"
+                      >
+                        <span>Open</span>
+                      </a>
+                    )}
                   </div>
                 </div>
 
@@ -1801,7 +1854,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                     {/* WhatsApp */}
                     <a
                       href={`https://wa.me/?text=${encodeURIComponent(
-                        `* Track my DriveC ride live in real-time!\n* Pickup: ${shareTripModalBooking.pickupLocation}\n* Destination: ${shareTripModalBooking.destinationLocation}\n* Pilot: ${shareTripModalBooking.driverName || 'Verified Chauffeur'}${shareTripModalBooking.driverVehicle ? ` (${shareTripModalBooking.driverVehicle})` : ''}\n\n* Free Live OpenStreetMap Route:\n${getClickableShareUrl(shareUrl)}\n\nReal-time tracking • No app download or login required.`
+                        buildShareMessage(shareTripModalBooking, shareUrl)
                       )}`}
                       target="_blank"
                       rel="noopener noreferrer"
@@ -1813,7 +1866,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                     {/* Telegram */}
                     <a
                       href={`https://t.me/share/url?url=${encodeURIComponent(getClickableShareUrl(shareUrl))}&text=${encodeURIComponent(
-                        `* Track my DriveC ride live in real-time!\n* Pickup: ${shareTripModalBooking.pickupLocation}\n* Destination: ${shareTripModalBooking.destinationLocation}\n* Pilot: ${shareTripModalBooking.driverName || 'Verified Chauffeur'}${shareTripModalBooking.driverVehicle ? ` (${shareTripModalBooking.driverVehicle})` : ''}\n\n* Free Live OpenStreetMap Route:`
+                        buildShareMessage(shareTripModalBooking, shareUrl)
                       )}`}
                       target="_blank"
                       rel="noopener noreferrer"
@@ -1825,7 +1878,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                     {/* SMS */}
                     <a
                       href={`sms:?body=${encodeURIComponent(
-                        `* Track my DriveC ride live in real-time!\n* Pickup: ${shareTripModalBooking.pickupLocation}\n* Destination: ${shareTripModalBooking.destinationLocation}\n* Pilot: ${shareTripModalBooking.driverName || 'Verified Chauffeur'}${shareTripModalBooking.driverVehicle ? ` (${shareTripModalBooking.driverVehicle})` : ''}\n\n* Free Live OpenStreetMap Route:\n${getClickableShareUrl(shareUrl)}\n\nReal-time tracking • No app download or login required.`
+                        buildShareMessage(shareTripModalBooking, shareUrl)
                       )}`}
                       className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-xs cursor-pointer transition-colors"
                     >
@@ -1979,11 +2032,16 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                 <div>
                   <label className="block font-bold text-slate-300 mb-2">Select Payment Method</label>
                   <div className="grid grid-cols-3 gap-2">
-                    {(['upi', 'cash', 'card'] as const).map((method) => (
+                    {(['cash', 'card', 'upi'] as const).map((method) => (
                       <button
                         key={method}
-                        onClick={() => setSelectedPayMethod(method)}
-                        className={`py-3 rounded-2xl border-2 font-bold flex flex-col items-center gap-1.5 transition-all ${
+                        type="button"
+                        onClick={() => {
+                          setSelectedPayMethod(method);
+                          setCashHandedConfirmed(false);
+                          setPaymentError('');
+                        }}
+                        className={`py-3 rounded-2xl border-2 font-bold flex flex-col items-center gap-1.5 transition-all cursor-pointer ${
                           selectedPayMethod === method
                             ? 'border-[#002C6C] bg-[#002C6C] text-white'
                             : 'border-[#262b36] bg-[#0d1017] text-slate-300 hover:border-[#262b36]'
@@ -1993,25 +2051,89 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                       </button>
                     ))}
                   </div>
+
+                  {selectedPayMethod === 'cash' && (
+                    <div className="mt-3 p-3 bg-emerald-950/50 border border-emerald-700/80 rounded-xl space-y-2">
+                      <p className="text-[11px] text-emerald-200 font-semibold text-center">
+                        Please hand ₹{paymentModalBooking.fareBreakdown.totalFare} in cash directly to your driver, then confirm below.
+                      </p>
+                      <label className="flex items-start gap-2.5 p-2 rounded-lg bg-[#0d1017]/80 border border-emerald-700/60 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={cashHandedConfirmed}
+                          onChange={(e) => {
+                            setCashHandedConfirmed(e.target.checked);
+                            setPaymentError('');
+                          }}
+                          className="mt-0.5 rounded text-emerald-500 focus:ring-emerald-500 w-4 h-4 cursor-pointer"
+                        />
+                        <span className="text-[11px] font-semibold text-emerald-100 leading-snug">
+                          I confirm that I have handed ₹{paymentModalBooking.fareBreakdown.totalFare} in cash to the driver.
+                        </span>
+                      </label>
+                    </div>
+                  )}
+
+                  {selectedPayMethod === 'card' && (
+                    <div className="mt-3 p-3 bg-[#0d1424] border border-blue-800/70 rounded-xl text-center space-y-1">
+                      <span className="text-[11px] font-bold text-cyan-300 block">Credit / Debit Card Payment</span>
+                      <span className="text-[10px] text-cyan-300/80 block">
+                        Pay ₹{paymentModalBooking.fareBreakdown.totalFare} securely via Visa, Mastercard, or RuPay
+                      </span>
+                    </div>
+                  )}
+
+                  {selectedPayMethod === 'upi' && (
+                    <div className="mt-3 p-3 bg-[#0d1424] border border-blue-800/70 rounded-xl text-center space-y-1">
+                      <span className="text-[11px] font-bold text-cyan-300 block">UPI ID: drivec@icici</span>
+                      <span className="text-[10px] text-cyan-300/80 block">
+                        Pay ₹{paymentModalBooking.fareBreakdown.totalFare} with GPay, PhonePe, Paytm, or BHIM
+                      </span>
+                    </div>
+                  )}
+
+                  {paymentError && (
+                    <div className="mt-2 p-2.5 bg-rose-950/60 border border-rose-700/80 rounded-xl text-[11px] font-semibold text-rose-200">
+                      {paymentError}
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex gap-2 pt-1">
                   <button
+                    type="button"
                     onClick={() => setPaymentModalBooking(null)}
                     className="w-1/3 py-3 rounded-xl border border-[#262b36] text-slate-300 font-semibold"
                   >
                     Cancel
                   </button>
                   <button
-                    onClick={() => {
-                      if (onPassengerPayment) {
-                        onPassengerPayment(paymentModalBooking.id, selectedPayMethod);
-                        setPaymentSuccessMsg(`✓ ₹${paymentModalBooking.fareBreakdown.totalFare} paid successfully via ${selectedPayMethod.toUpperCase()} — Driver Wallet Credited!`);
+                    type="button"
+                    disabled={isSubmittingPayment || (selectedPayMethod === 'cash' && !cashHandedConfirmed)}
+                    onClick={async () => {
+                      if (!onPassengerPayment) return;
+                      if (selectedPayMethod === 'cash' && !cashHandedConfirmed) return;
+                      setIsSubmittingPayment(true);
+                      setPaymentError('');
+                      try {
+                        const options = selectedPayMethod === 'cash' ? { cashHandedConfirmed: true } : undefined;
+                        await onPassengerPayment(paymentModalBooking.id, selectedPayMethod, options);
+                        setPaymentSuccessMsg(`✓ ₹${paymentModalBooking.fareBreakdown.totalFare} paid successfully via ${selectedPayMethod.toUpperCase()} — Driver Wallet Crediting Unlocked!`);
+                      } catch (err: any) {
+                        setPaymentError(err?.message || 'Failed to confirm payment.');
+                      } finally {
+                        setIsSubmittingPayment(false);
                       }
                     }}
-                    className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black text-sm shadow-md transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-[0.99]"
+                    className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-black text-sm shadow-md transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-[0.99]"
                   >
-                    <span>Pay ₹{paymentModalBooking.fareBreakdown.totalFare}</span>
+                    <span>
+                      {isSubmittingPayment
+                        ? 'Processing...'
+                        : selectedPayMethod === 'cash'
+                          ? `Confirm Cash Handed (₹${paymentModalBooking.fareBreakdown.totalFare})`
+                          : `Pay ₹${paymentModalBooking.fareBreakdown.totalFare} (${selectedPayMethod.toUpperCase()})`}
+                    </span>
                   </button>
                 </div>
               </div>
@@ -2227,6 +2349,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                 <div className="flex flex-col sm:flex-row gap-2">
                   <button
                     onClick={() => {
+                      dismissedDeniedBookingIds.current.add(deniedBookingPopup.id);
                       setDeniedBookingPopup(null);
                       onNavigateToBooking();
                     }}
@@ -2237,6 +2360,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                   <button
                     onClick={async () => {
                       const id = deniedBookingPopup.id;
+                      dismissedDeniedBookingIds.current.add(id);
                       setDeniedBookingPopup(null);
                       try {
                         await fetch(`/api/bookings/${id}/status`, {
@@ -2257,6 +2381,7 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                 <div>
                   <button
                     onClick={() => {
+                      dismissedDeniedBookingIds.current.add(deniedBookingPopup.id);
                       setDeniedBookingPopup(null);
                       onNavigateToBooking();
                     }}
@@ -2266,6 +2391,16 @@ export const UserPortal: React.FC<UserPortalProps> = ({
                   </button>
                 </div>
               )}
+              <button
+                type="button"
+                onClick={() => {
+                  dismissedDeniedBookingIds.current.add(deniedBookingPopup.id);
+                  setDeniedBookingPopup(null);
+                }}
+                className="w-full py-2.5 rounded-xl bg-[#1c202a] hover:bg-[#252b38] text-slate-300 font-bold text-xs border border-[#262b36] transition-colors cursor-pointer"
+              >
+                Close
+              </button>
             </div>
           </div>
         );

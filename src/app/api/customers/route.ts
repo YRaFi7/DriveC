@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { validateMobileNumber } from '@/lib/validation';
 
 // GET /api/customers — list all customers or fetch single customer promo status
 export async function GET(req: NextRequest) {
@@ -73,6 +74,10 @@ export async function POST(req: NextRequest) {
 
     if (!name || !phone || !email || !city) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+    }
+    const phoneErr = validateMobileNumber(String(phone));
+    if (phoneErr) {
+      return NextResponse.json({ error: phoneErr }, { status: 400 });
     }
 
     // Default password to phone or 'kerago123' if not provided

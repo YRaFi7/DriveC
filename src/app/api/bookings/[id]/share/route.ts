@@ -57,10 +57,11 @@ export async function POST(
     const rawHost = req.headers.get('x-forwarded-host') || req.headers.get('host') || 'localhost:3000';
     const protocol = req.headers.get('x-forwarded-proto') || (rawHost.includes('localhost') || rawHost.includes('127.0.0.1') ? 'http' : 'https');
     
-    // In local development, resolve 'localhost' to a dotted IPv4 address (LAN IP or 127.0.0.1) so WhatsApp/SMS parsers recognize http:// as a clickable hyperlink
+    // In local development, resolve 'localhost' / raw IPv4 hosts using nip.io so WhatsApp/SMS parsers recognize http:// as a clickable hyperlink
     let effectiveHost = rawHost;
-    if (rawHost.startsWith('localhost:')) {
-      const port = rawHost.split(':')[1] || '3000';
+    const ipv4PortMatch = rawHost.match(/^(\d{1,3}(?:\.\d{1,3}){3})(:\d+)?$/);
+    if (rawHost.startsWith('localhost')) {
+      const port = rawHost.includes(':') ? rawHost.split(':')[1] : '3000';
       try {
         const os = require('os');
         const nets = os.networkInterfaces();
@@ -74,10 +75,12 @@ export async function POST(
           }
           if (lanIp) break;
         }
-        effectiveHost = `${lanIp || '127.0.0.1'}:${port}`;
+        effectiveHost = `${lanIp || '127.0.0.1'}.nip.io:${port}`;
       } catch (e) {
-        effectiveHost = `127.0.0.1:${port}`;
+        effectiveHost = `127.0.0.1.nip.io:${port}`;
       }
+    } else if (ipv4PortMatch) {
+      effectiveHost = `${ipv4PortMatch[1]}.nip.io${ipv4PortMatch[2] || ''}`;
     }
 
     const shareUrl = `${protocol}://${effectiveHost}/track/${token}`;

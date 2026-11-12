@@ -463,8 +463,8 @@ export default function HomePage() {
   };
 
   // Cancel booking (Requirement 2: Cancelled rides = zero payment)
-  const handleCancelBooking = (bookingId: string) => {
-    handleUpdateBookingStatus(bookingId, 'cancelled', {
+  const handleCancelBooking = async (bookingId: string) => {
+    await handleUpdateBookingStatus(bookingId, 'cancelled', {
       cancelledBy: 'customer',
       cancellationReason: 'Cancelled by customer',
       driverCreditedSalary: 0,
@@ -545,7 +545,7 @@ export default function HomePage() {
   };
 
   // Booking Created
-  const handleBookingCreated = async (newBooking: Booking): Promise<{ success: boolean; booking?: Booking; error?: string; errorCode?: string; mode?: string }> => {
+  const handleBookingCreated = async (newBooking: Booking): Promise<{ success: boolean; booking?: Booking; activeBooking?: Booking; error?: string; errorCode?: string; mode?: string }> => {
     try {
       const res = await fetch('/api/bookings', {
         method: 'POST',
@@ -563,8 +563,9 @@ export default function HomePage() {
         return {
           success: false,
           error: data.message || data.error || 'Failed to create booking',
-          errorCode: data.error,
-          mode: data.driverSelectionMode
+          errorCode: data.code || data.error,
+          mode: data.driverSelectionMode,
+          activeBooking: data.activeBooking,
         };
       }
     } catch (err: any) {
@@ -575,50 +576,29 @@ export default function HomePage() {
 
   // Update Booking Status (with optional extra fields for OTP / cancelledBy etc.)
   const handleUpdateBookingStatus = async (bookingId: string, status: Booking['status'], extra?: Record<string, unknown>) => {
-    const isNowCompleted = status === 'completed';
     const isNowCancelled = status === 'cancelled';
 
+    // Optimistic update for non-financial transitions; financial stats & completed trip counts
+    // are strictly driven by confirmed server responses so duplicates never inflate totals.
     setState(prev => {
       const updated = prev.bookings.map(b => {
         if (b.id === bookingId) {
           const isDelayed = extra?.isDelayed !== undefined ? Boolean(extra.isDelayed) : Boolean(b.isDelayed);
-          const { driverSalary, platformCommission, delayPenalty } = isNowCancelled
-            ? { driverSalary: 0, platformCommission: 0, delayPenalty: 0 }
-            : calculateDriverSalary(b.fareBreakdown.totalFare, isDelayed, status);
-
           return {
             ...b,
             status,
             isDelayed,
             ...(isNowCancelled ? { driverCreditedSalary: 0, platformCommission: 0, delayPenalty: 0 } : {}),
-            ...(isNowCompleted ? { driverCreditedSalary: driverSalary, platformCommission, delayPenalty } : {}),
             ...(extra || {}),
-            paymentStatus: isNowCompleted ? ('completed' as const) : (isNowCancelled ? ('refunded' as const) : b.paymentStatus)
+            paymentStatus: extra?.remainingPaid ? ('completed' as const) : (isNowCancelled ? ('refunded' as const) : b.paymentStatus)
           };
         }
         return b;
       });
 
-      // If completed, update driver trip count
-      const target = prev.bookings.find(b => b.id === bookingId);
-      let updatedDrivers = prev.drivers;
-      if (isNowCompleted && target && target.driverId) {
-        updatedDrivers = prev.drivers.map(d => {
-          if (d.id === target.driverId) {
-            return {
-              ...d,
-              totalTrips: d.totalTrips + 1,
-              totalEarnings: d.totalEarnings + target.fareBreakdown.totalFare
-            };
-          }
-          return d;
-        });
-      }
-
       return {
         ...prev,
         bookings: updated,
-        drivers: updatedDrivers,
         rentalExtensions: extra?.remainingPaid
           ? (prev.rentalExtensions || []).map(e => e.bookingId === bookingId && e.status === 'approved' ? { ...e, paymentStatus: 'completed' as const } : e)
           : prev.rentalExtensions
@@ -626,35 +606,87 @@ export default function HomePage() {
     });
 
     try {
-      await fetch(`/api/bookings/${bookingId}/status`, {
+      const res = await fetch(`/api/bookings/${bookingId}/status`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ status, ...(extra || {}) }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.booking) {
+        setState(prev => ({
+          ...prev,
+          bookings: prev.bookings.map(b => b.id === bookingId ? { ...b, ...data.booking } : b),
+        }));
+      } else if (!res.ok) {
+        // Re-sync from server booking if conflict/rejected
+        if (data.booking) {
+          setState(prev => ({
+            ...prev,
+            bookings: prev.bookings.map(b => b.id === bookingId ? { ...b, ...data.booking } : b),
+          }));
+        }
+        console.warn('Status update rejected by server:', data.error || res.status);
+      }
     } catch (err) {
       console.error('Error updating booking status in DB:', err);
     }
   };
 
-  // Passenger completes payment
-  const handlePassengerPayment = async (bookingId: string, paymentMethod: 'cash' | 'upi' | 'card') => {
-    setState(prev => ({
-      ...prev,
-      bookings: prev.bookings.map(b =>
-        b.id === bookingId
-          ? { ...b, passengerPaid: true, paymentStatus: 'completed' as const, paymentMethod }
-          : b
-      )
-    }));
-    try {
-      await fetch(`/api/bookings/${bookingId}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passengerPaid: true, paymentMethod }),
-      });
-    } catch (err) {
-      console.error('Error saving passenger payment to DB:', err);
+  // Passenger completes payment (verified server-side before marking ride completed)
+  const handlePassengerPayment = async (
+    bookingId: string,
+    paymentMethod: 'cash' | 'upi' | 'card',
+    options?: { cashHandedConfirmed?: boolean; gatewayVerified?: boolean; gatewayPaymentId?: string }
+  ) => {
+    const res = await fetch(`/api/bookings/${bookingId}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        passengerPaid: true,
+        paymentMethod,
+        cashHandedConfirmed: options?.cashHandedConfirmed,
+        gatewayVerified: options?.gatewayVerified,
+        gatewayPaymentId: options?.gatewayPaymentId,
+      }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(data.error || data.message || 'Payment confirmation failed');
+      (err as any).code = data.code;
+      throw err;
     }
+
+    setState(prev => {
+      const target = prev.bookings.find(b => b.id === bookingId);
+      const wasAlreadyCompleted = target?.status === 'completed' || target?.passengerPaid;
+      const updatedBookings = prev.bookings.map(b =>
+        b.id === bookingId
+          ? {
+              ...b,
+              ...(data.booking || {}),
+              passengerPaid: true,
+              paymentStatus: 'completed' as const,
+              paymentMethod,
+              status: 'completed' as const,
+            }
+          : b
+      );
+      const updatedDrivers = prev.drivers.map(d => {
+        if (target?.driverId && d.id === target.driverId) {
+          const nextTrips = typeof data.driverTotalTrips === 'number'
+            ? data.driverTotalTrips
+            : (wasAlreadyCompleted ? d.totalTrips : d.totalTrips + 1);
+          return { ...d, totalTrips: nextTrips };
+        }
+        return d;
+      });
+      return {
+        ...prev,
+        bookings: updatedBookings,
+        drivers: updatedDrivers,
+      };
+    });
   };
 
   // Driver confirms payment received → credits 40% salary (minus 3% if delayed) to driver wallet
@@ -713,7 +745,11 @@ export default function HomePage() {
       ),
       drivers: prev.drivers.map(d =>
         d.id === booking.driverId
-          ? { ...d, walletBalance: typeof data.walletBalance === 'number' ? data.walletBalance : (d.walletBalance || 0) + creditedSalary }
+          ? {
+              ...d,
+              walletBalance: typeof data.walletBalance === 'number' ? data.walletBalance : (d.walletBalance || 0) + creditedSalary,
+              totalEarnings: typeof data.totalEarnings === 'number' ? data.totalEarnings : (d.totalEarnings || 0) + creditedSalary,
+            }
           : d
       )
     }));

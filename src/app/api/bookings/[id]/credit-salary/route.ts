@@ -115,6 +115,13 @@ export async function POST(
 
     // Execute atomic credit transaction
     const result = await prisma.$transaction(async (tx) => {
+      const freshBooking = await tx.booking.findUnique({ where: { id: booking.id } });
+      if (!freshBooking || freshBooking.driverPaymentReceived || freshBooking.salaryCreditTxId) {
+        const dupErr: any = new Error('Salary for this ride has already been credited to your wallet.');
+        dupErr.code = 'P2002';
+        throw dupErr;
+      }
+
       // 1. Create DriverWalletTransaction (guaranteed unique by bookingId)
       const walletTx = await tx.driverWalletTransaction.create({
         data: {
@@ -162,8 +169,10 @@ export async function POST(
       success: true,
       creditedAmount: netSalary,
       creditedSalary: netSalary,
+      platformCommission,
       salaryCreditTxId: result.walletTx.id,
       walletBalance: result.updatedDriver.walletBalance,
+      totalEarnings: result.updatedDriver.totalEarnings,
       transaction: result.walletTx,
       booking: result.updatedBooking,
       message: `₹${netSalary} successfully credited to driver wallet.`
